@@ -19,6 +19,7 @@ pub mod error;
 pub mod frame;
 pub mod kernel;
 pub mod pipe;
+pub(crate) mod router;
 pub mod sender;
 pub mod sigcall;
 pub mod syscall;

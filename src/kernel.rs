@@ -1,4 +1,8 @@
-//! Kernel — single event loop that routes frames between subsystems.
+//! Kernel — builder for subsystem registration and wiring.
+//!
+//! The kernel owns configuration and registration. When [`Kernel::start`] is
+//! called, it creates a [`Router`](crate::router::Router) and hands off all
+//! routing state. The kernel is the builder; the router is the runtime.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,24 +13,16 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::backpressure::{BackpressureConfig, StreamController};
-use crate::error::KernelError;
 use crate::frame::{Frame, Status};
 use crate::pipe::{self, PipeEnd};
+use crate::router::Router;
 use crate::sender::FrameSender;
 use crate::sigcall::SigcallRegistry;
 use crate::syscall::Syscall;
 
 const CHANNEL_BUFFER: usize = 256;
 
-type PendingRoutes = Arc<Mutex<HashMap<Uuid, Vec<StreamController>>>>;
-type ActiveRequests = Arc<Mutex<HashMap<Uuid, ActiveEntry>>>;
-
-struct ActiveEntry {
-    subsystem_tx: mpsc::Sender<Frame>,
-    cancel: CancellationToken,
-}
-
-/// The microkernel: a single event loop that routes frames by syscall prefix.
+/// The microkernel: registers subsystems, then starts a router event loop.
 ///
 /// # Usage
 ///
@@ -67,13 +63,13 @@ impl Kernel {
     }
 
     /// Get a cloneable sender for submitting frames to the kernel.
-    #[must_use] 
+    #[must_use]
     pub fn sender(&self) -> mpsc::Sender<Frame> {
         self.inbound_tx.clone()
     }
 
     /// Get a reference to the sigcall registry.
-    #[must_use] 
+    #[must_use]
     pub fn sigcalls(&self) -> &SigcallRegistry {
         &self.sigcalls
     }
@@ -155,20 +151,19 @@ impl Kernel {
     /// Returns a receiver channel. Must be called before [`start`](Kernel::start).
     pub fn subscribe(&mut self) -> mpsc::Receiver<Frame> {
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-        self.subscribers.push(StreamController::new(tx, self.backpressure.clone()));
+        self.subscribers
+            .push(StreamController::new(tx, self.backpressure.clone()));
         rx
     }
 
     /// Start the kernel event loop. Consumes self.
     ///
-    /// Spawns bridge tasks for each registered pipe and the main router loop.
-    #[must_use] 
+    /// Creates a [`Router`] and spawns it as the runtime event loop.
+    /// Bridges each registered pipe back to the inbound channel.
+    #[must_use]
     pub fn start(mut self) -> JoinHandle<()> {
         let mut inbound_rx = self.inbound_rx.take().expect("kernel already started");
         let inbound_tx = self.inbound_tx.clone();
-        let routes = self.routes;
-        let subscribers = self.subscribers;
-        let sigcalls = self.sigcalls;
 
         // Bridge each pipe's kernel-side end back to the inbound channel.
         for (_kernel_tx, mut kernel_end) in self.pipe_ends {
@@ -182,19 +177,10 @@ impl Kernel {
             });
         }
 
-        let pending: PendingRoutes = Arc::new(Mutex::new(HashMap::new()));
-        let active: ActiveRequests = Arc::new(Mutex::new(HashMap::new()));
+        let mut router = Router::new(self.routes, self.subscribers, self.sigcalls);
 
         tokio::spawn(async move {
-            router_loop(
-                &mut inbound_rx,
-                &routes,
-                &subscribers,
-                &sigcalls,
-                &pending,
-                &active,
-            )
-            .await;
+            router.run(&mut inbound_rx).await;
         })
     }
 }
@@ -202,190 +188,6 @@ impl Kernel {
 impl Default for Kernel {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ── Router ──
-
-async fn router_loop(
-    rx: &mut mpsc::Receiver<Frame>,
-    routes: &HashMap<String, mpsc::Sender<Frame>>,
-    subscribers: &[StreamController],
-    sigcalls: &SigcallRegistry,
-    pending: &PendingRoutes,
-    active: &ActiveRequests,
-) {
-    while let Some(frame) = rx.recv().await {
-        match frame.status {
-            Status::Request => {
-                route_request(&frame, routes, subscribers, sigcalls, pending, active).await;
-            }
-            Status::Cancel => {
-                route_cancel(&frame, pending, active);
-            }
-            _ => {
-                route_response(&frame, pending, active).await;
-            }
-        }
-    }
-}
-
-async fn route_request(
-    frame: &Frame,
-    routes: &HashMap<String, mpsc::Sender<Frame>>,
-    subscribers: &[StreamController],
-    sigcalls: &SigcallRegistry,
-    pending: &PendingRoutes,
-    active: &ActiveRequests,
-) {
-    // Handle sigcall management syscalls inline
-    if frame.prefix() == "sigcall" {
-        handle_sigcall_management(frame, sigcalls, subscribers, pending).await;
-        return;
-    }
-
-    // Find the subsystem channel: built-in routes first, then sigcall registry
-    let subsystem_tx = routes
-        .get(frame.prefix())
-        .cloned()
-        .or_else(|| sigcalls.lookup(&frame.syscall));
-
-    let Some(subsystem_tx) = subsystem_tx else {
-        let err = KernelError::no_route(format!("no handler for syscall: {}", frame.syscall));
-        let error_frame = frame.error_from(&err);
-        for sub in subscribers {
-            sub.send(&error_frame).await;
-        }
-        return;
-    };
-
-    // Register response destinations
-    {
-        let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(
-            frame.id,
-            subscribers.iter().map(StreamController::clone).collect(),
-        );
-    }
-
-    // Track active request for cancel forwarding
-    let cancel = CancellationToken::new();
-    {
-        let mut guard = active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(
-            frame.id,
-            ActiveEntry {
-                subsystem_tx: subsystem_tx.clone(),
-                cancel,
-            },
-        );
-    }
-
-    // Forward to subsystem
-    let _ = subsystem_tx.send(frame.clone()).await;
-}
-
-async fn route_response(frame: &Frame, pending: &PendingRoutes, active: &ActiveRequests) {
-    let Some(parent_id) = frame.parent_id else {
-        return;
-    };
-
-    let controllers = {
-        let guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(&parent_id).cloned()
-    };
-
-    let Some(controllers) = controllers else {
-        return;
-    };
-
-    for ctrl in &controllers {
-        ctrl.send(frame).await;
-    }
-
-    if frame.status.is_terminal() {
-        let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&parent_id);
-
-        let mut guard = active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&parent_id);
-    }
-}
-
-fn route_cancel(frame: &Frame, pending: &PendingRoutes, active: &ActiveRequests) {
-    let Some(target_id) = frame.parent_id else {
-        return;
-    };
-
-    let entry = {
-        let mut guard = active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&target_id)
-    };
-
-    if let Some(entry) = entry {
-        // Trigger cancellation token
-        entry.cancel.cancel();
-        // Forward cancel frame to subsystem
-        let _ = entry.subsystem_tx.try_send(frame.clone());
-    }
-
-    // Clean up pending
-    {
-        let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&target_id);
-    }
-}
-
-// ── Inline sigcall management ──
-
-async fn handle_sigcall_management(
-    frame: &Frame,
-    sigcalls: &SigcallRegistry,
-    subscribers: &[StreamController],
-    pending: &PendingRoutes,
-) {
-    let verb = frame.verb();
-    let response = match verb {
-        "list" => {
-            let entries = sigcalls.list();
-            // Send each entry as an item, then done
-            for (name, owner) in &entries {
-                let mut data = crate::frame::Data::new();
-                data.insert("name".into(), serde_json::Value::String(name.clone()));
-                data.insert("owner".into(), serde_json::Value::String(owner.clone()));
-                let item = frame.item(data);
-                for sub in subscribers {
-                    sub.send(&item).await;
-                }
-            }
-            frame.done()
-        }
-        "register" | "unregister" => {
-            // These require a sigcall channel to be passed, which happens
-            // at the application layer (not inline). Return error for now
-            // if called without proper context.
-            frame.error("sigcall:register and sigcall:unregister must be called through the SigcallRegistry API directly")
-        }
-        _ => frame.error(format!("unknown sigcall operation: {verb}")),
-    };
-
-    // Register pending so the response routes correctly
-    {
-        let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(
-            frame.id,
-            subscribers.iter().map(StreamController::clone).collect(),
-        );
-    }
-
-    for sub in subscribers {
-        sub.send(&response).await;
-    }
-
-    // Clean up
-    if response.status.is_terminal() {
-        let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.remove(&frame.id);
     }
 }
 
