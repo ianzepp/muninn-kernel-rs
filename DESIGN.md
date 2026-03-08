@@ -65,17 +65,31 @@ Frames are constructed via builder methods on a request frame, ensuring `parent_
 impl Frame {
     // Create a new request
     pub fn request(syscall: &str) -> Self;
+    pub fn request_with(syscall: &str, data: Data) -> Self;
 
     // Response constructors (set parent_id = self.id)
     pub fn item(&self, data: Data) -> Self;
+    pub fn item_from<T: Serialize>(&self, value: &T) -> Self;
     pub fn bulk(&self, data: Data) -> Self;
+    pub fn bulk_from<T: Serialize>(&self, value: &T) -> Self;
     pub fn done(&self) -> Self;
     pub fn done_with(&self, data: Data) -> Self;
+    pub fn done_from<T: Serialize>(&self, value: &T) -> Self;
     pub fn error(&self, message: impl Into<String>) -> Self;
-    pub fn error_from(&self, err: &impl ErrorCode) -> Self;
+    pub fn error_from(&self, err: &(impl ErrorCode + ?Sized)) -> Self;
     pub fn cancel(&self) -> Self;
+
+    // Builders
+    pub fn with_from(self, from: impl Into<String>) -> Self;
+    pub fn with_trace(self, trace: Value) -> Self;
+    pub fn with_data(self, key: impl Into<String>, value: Value) -> Self;
+    pub fn with_field(self, key: impl Into<String>, value: impl Serialize) -> Self;
 }
 ```
+
+The `_from` variants (`item_from`, `done_from`, `bulk_from`) serialize a struct directly into the frame's data map via `to_data()`. If the value serializes to a JSON object, its fields become data keys; otherwise the value is stored under a `"value"` key.
+
+`with_field` accepts `impl Serialize` instead of `Value`, so handlers don't need to import `serde_json::Value` or manually construct `Value` variants.
 
 ### ErrorCode Trait
 
@@ -94,39 +108,43 @@ The `error_from` helper on Frame converts any `ErrorCode` implementor into a pro
 
 ## Architecture
 
-### Kernel
+### Kernel / Router Split
 
-The kernel is a **single async event loop** consuming frames from one inbound `mpsc` channel. It owns the routing table and dispatches frames by syscall prefix.
+The crate separates the **builder** (Kernel) from the **runtime** (Router), following the pattern from monk-os-kernel where the kernel manages state and the dispatcher handles message flow.
+
+**Kernel** — owns configuration, registration, and wiring. Consumed by `start()`.
+
+**Router** — owns the event loop and routing state (`pending`, `active`). Created by `Kernel::start()` and runs as a single spawned task. The router's state is plain `HashMap` (no `Arc<Mutex>`) since it runs on one task.
 
 ```
-                    ┌─────────────────────────────┐
-                    │          Kernel              │
-                    │                              │
-  inbound_tx ──────►  match frame.status {        │
-  (cloned to all)  │    Request => route_request  │
-                    │    Cancel  => route_cancel   │
-                    │    _       => route_response │
-                    │  }                           │
-                    │                              │
-                    │  routes: HashMap<prefix, tx> │
-                    │  pending: HashMap<id, [tx]>  │
-                    │  active: HashMap<id, tx>     │
-                    │  sigcalls: SigcallRegistry   │
-                    └─────────────────────────────┘
-                         │           │
-              ┌──────────┘           └──────────┐
-              ▼                                  ▼
-        Subsystem A                        Subsystem B
-        (PipeEnd)                          (PipeEnd)
+  ┌──────────────────┐         ┌─────────────────────────────┐
+  │   Kernel (setup)  │         │       Router (runtime)       │
+  │                   │         │                              │
+  │  routes           │──start──►  match frame.status {        │
+  │  subscribers      │         │    Request => route_request  │
+  │  sigcalls         │         │    Cancel  => route_cancel   │
+  │  backpressure cfg │         │    _       => route_response │
+  │  pipe_ends        │         │  }                           │
+  └──────────────────┘         │                              │
+                                │  routes: HashMap<prefix, tx> │
+  inbound_tx ──────────────────►  pending: HashMap<id, [ctrl]> │
+  (cloned to all)               │  active: HashMap<id, entry>  │
+                                │  sigcalls: SigcallRegistry   │
+                                └─────────────────────────────┘
+                                     │           │
+                          ┌──────────┘           └──────────┐
+                          ▼                                  ▼
+                    Subsystem A                        Subsystem B
+                    (PipeEnd)                          (PipeEnd)
 ```
 
 **Routing logic:**
 
 1. **Request frames**: Extract prefix from `syscall` (e.g., `"vfs:read"` → `"vfs"`). Look up the subsystem channel in `routes`. If not found, check the sigcall registry. If still not found, send an error response back to all subscribers.
 
-2. **Cancel frames**: Look up `parent_id` in `active` (which subsystem is handling the target request). Forward the cancel frame to that subsystem. Clean up `pending` and `active` entries.
+2. **Cancel frames**: Look up `parent_id` in `active` (which subsystem is handling the target request). Forward the cancel frame to that subsystem. Trigger the `CancellationToken`. Clean up `pending` and `active` entries.
 
-3. **Response frames** (Item, Bulk, Done, Error): Look up `parent_id` in `pending` to find which callers are waiting. Fan out the response to all registered senders. On terminal status, remove entries from `pending` and `active`.
+3. **Response frames** (Item, Bulk, Done, Error): Look up `parent_id` in `pending` to find which `StreamController`-wrapped subscribers are waiting. Fan out the response with backpressure. On terminal status, remove entries from `pending` and `active`.
 
 ### Subsystem Registration
 
@@ -136,10 +154,13 @@ impl Kernel {
     /// Returns a PipeEnd for the subsystem to receive requests and send responses.
     pub fn register(&mut self, prefix: &str) -> PipeEnd;
 
-    /// Subscribe to receive response frames (for callers outside the kernel).
-    pub fn subscribe(&mut self) -> Subscriber;
+    /// Register a Syscall trait implementor (auto-creates pipe and receive loop).
+    pub fn register_syscall(&mut self, handler: Arc<dyn Syscall>);
 
-    /// Start the kernel event loop. Consumes self.
+    /// Subscribe to receive response frames (returns raw mpsc::Receiver).
+    pub fn subscribe(&mut self) -> mpsc::Receiver<Frame>;
+
+    /// Start the kernel event loop. Creates a Router and consumes self.
     pub fn start(self) -> JoinHandle<()>;
 }
 ```
@@ -239,11 +260,15 @@ pub trait Syscall: Send + Sync {
         tx: &FrameSender,
         caller: &Caller,
         cancel: CancellationToken,
-    ) -> Result<(), Box<dyn ErrorCode>>;
+    ) -> Result<(), Box<dyn ErrorCode + Send>>;
 }
 ```
 
-The kernel provides a convenience method to register a `Syscall` implementor, which internally creates a pipe, spawns a receive loop, and wires up the FrameSender and Caller.
+The kernel provides a convenience method `register_syscall()` which internally creates a pipe, spawns a receive loop, and wires up the FrameSender and Caller.
+
+### Error Handling
+
+Returning `Err` from `dispatch` causes the kernel to automatically send an error frame on behalf of the handler via `frame.error_from(&*err)`. This removes boilerplate for the common case where a single error terminates the stream. Handlers that need to send partial results before failing should use `FrameSender` directly and return `Ok(())`.
 
 ### FrameSender
 
@@ -326,15 +351,15 @@ When the kernel receives a Request frame and the prefix is not in the built-in r
 
 ### Sigcall Management Syscalls
 
-The kernel provides built-in syscalls for managing the registry:
+The router handles `sigcall:*` requests inline (not routed to a subsystem):
 
-| Syscall | Description |
-|---|---|
-| `sigcall:register` | Register a handler for a name |
-| `sigcall:unregister` | Unregister a handler |
-| `sigcall:list` | List all registered handlers |
+| Syscall | Status | Description |
+|---|---|---|
+| `sigcall:list` | Implemented | Lists all registered handlers (streams Item frames) |
+| `sigcall:register` | API only | Must be called via `SigcallRegistry` directly |
+| `sigcall:unregister` | API only | Must be called via `SigcallRegistry` directly |
 
-These are handled inline by the kernel (not routed to a subsystem).
+`sigcall:register` and `sigcall:unregister` are not yet functional as frame-based operations because they require passing a channel sender, which can't be carried in a frame. Registration and unregistration are done via the `SigcallRegistry` API before or during runtime.
 
 ### Ownership and Cleanup
 
@@ -347,37 +372,48 @@ These are handled inline by the kernel (not routed to a subsystem).
 
 ## Backpressure
 
-Response streams can overwhelm slow consumers. The kernel implements watermark-based backpressure on response delivery (from monk-os StreamController and Abbot's dispatcher):
+Response streams can overwhelm slow consumers. The kernel implements watermark-based backpressure on response delivery (from monk-os StreamController and Abbot's dispatcher).
 
 ### StreamController
 
+`StreamController` wraps an `mpsc::Sender<Frame>` and tracks per-stream buffer depth (keyed by `parent_id`). Subscribers are automatically wrapped when created via `kernel.subscribe()`.
+
 ```rust
-pub struct StreamController {
-    high_watermark: usize,      // Pause producer when buffered > this (default: 1000)
-    low_watermark: usize,       // Resume producer when buffered < this (default: 100)
-    stall_timeout: Duration,    // Cancel if consumer stalls beyond this (default: 5s)
+pub struct BackpressureConfig {
+    pub high_watermark: usize,      // default: 1000
+    pub low_watermark: usize,       // default: 100
+    pub stall_timeout: Duration,    // default: 5s
+}
+
+pub enum SendOutcome {
+    Delivered,  // Frame was sent successfully
+    Stalled,    // Consumer didn't drain within stall_timeout
+    Closed,     // Channel closed — subscriber is gone
 }
 ```
 
-**State machine:**
-```
-FLOWING → (buffered >= high_watermark) → PAUSED
-PAUSED  → (consumer acks, buffered <= low_watermark) → FLOWING
-PAUSED  → (stall_timeout elapsed, no consumer ack) → CANCELLED
-```
+**Flow control per stream:**
+- **Flowing** (buffered < `high_watermark`): Uses `try_send`. Falls back to blocking on channel-full.
+- **Paused** (buffered >= `high_watermark`): Uses `send` with `stall_timeout`. Returns `Stalled` on timeout.
+- **Terminal frames**: Always attempted, then stream tracking is cleaned up regardless of outcome.
 
 **Where applied:**
-- Between the kernel and external subscribers (gateway connections).
+- Between the router and external subscribers (gateway connections).
 - Not applied between kernel and built-in subsystems (trusted, co-located code).
 
-### Implementation
+### Configuration
 
-The kernel wraps outbound delivery to subscribers with a `StreamController`. When a subscriber's channel is full (bounded `mpsc`), the controller:
+```rust
+// Default backpressure
+let kernel = Kernel::new();
 
-1. Tracks the gap between produced and consumed frames.
-2. When the gap exceeds `high_watermark`, the producer task yields (does not drop frames).
-3. When the consumer catches up below `low_watermark`, the producer resumes.
-4. If the consumer doesn't catch up within `stall_timeout`, the stream is cancelled and the subscriber is removed.
+// Custom backpressure
+let kernel = Kernel::with_backpressure(BackpressureConfig {
+    high_watermark: 500,
+    low_watermark: 50,
+    stall_timeout: Duration::from_secs(10),
+});
+```
 
 ---
 
@@ -388,29 +424,29 @@ Cancellation is cooperative and propagated via `tokio_util::sync::CancellationTo
 ### Flow
 
 1. Caller sends a `Cancel` frame with `parent_id` set to the target request's `id`.
-2. Kernel looks up the target in `active` to find which subsystem is handling it.
-3. Kernel forwards the Cancel frame to the subsystem.
-4. Kernel triggers the `CancellationToken` associated with the request.
-5. Subsystem checks `cancel.is_cancelled()` at yield points and exits early.
-6. Kernel cleans up `pending` and `active` entries.
+2. Router looks up the target in `active` to find which subsystem is handling it.
+3. Router triggers the `CancellationToken` associated with the request.
+4. Router forwards the Cancel frame to the subsystem.
+5. Router cleans up `pending` and `active` entries.
+
+For `register_syscall` handlers, the subsystem receive loop maintains its own token map. When a Cancel frame arrives, it removes the token and calls `cancel()`. The handler observes cancellation via `cancel.is_cancelled()` or `cancel.cancelled().await`.
 
 ### In Syscall Handlers
 
 ```rust
-async fn dispatch(&self, frame: &Frame, tx: &FrameSender, caller: &Caller, cancel: CancellationToken) {
-    // Check before expensive work
-    if cancel.is_cancelled() {
-        return Err(Box::new(KernelError::cancelled()));
-    }
-
-    // Long-running work
+async fn dispatch(
+    &self,
+    frame: &Frame,
+    tx: &FrameSender,
+    _caller: &Caller,
+    cancel: CancellationToken,
+) -> Result<(), Box<dyn ErrorCode + Send>> {
     for item in items {
         if cancel.is_cancelled() {
             return Err(Box::new(KernelError::cancelled()));
         }
         tx.send_item(frame, &item).await;
     }
-
     tx.send_done(frame).await;
     Ok(())
 }
@@ -420,22 +456,26 @@ async fn dispatch(&self, frame: &Frame, tx: &FrameSender, caller: &Caller, cance
 
 ## Subscriber
 
-External code (gateways, test harnesses) receives response frames via a `Subscriber`:
+External code (gateways, test harnesses) receives response frames via `kernel.subscribe()`, which returns a raw `mpsc::Receiver<Frame>`. Internally, each subscriber is wrapped in a `StreamController` for backpressure.
 
 ```rust
-pub struct Subscriber {
-    rx: mpsc::Receiver<Frame>,
-}
-
-impl Subscriber {
-    /// Receive the next frame.
-    pub async fn recv(&mut self) -> Option<Frame>;
+let mut rx = kernel.subscribe();
+while let Some(frame) = rx.recv().await {
+    // handle frame
 }
 ```
 
 Subscribers see **all** response frames that flow through the kernel (fan-out from `pending`). A subscriber is created via `kernel.subscribe()` before `kernel.start()`.
 
 For room-scoped or connection-scoped delivery, the gateway layer filters frames by `parent_id` correlation or `trace` metadata — the kernel itself does not filter.
+
+### Future: Subscriber Type
+
+A dedicated `Subscriber` wrapper may be added to provide:
+- Filtering by `parent_id` or syscall prefix (connection-scoped delivery)
+- Typed deserialization helpers (`recv_as::<T>()`)
+- Backpressure acknowledgment signals back to the `StreamController`
+- Automatic reconnect/resubscribe on channel close
 
 ---
 
@@ -447,15 +487,14 @@ rust-kernel/
 ├── DESIGN.md
 ├── src/
 │   ├── lib.rs              — Crate root, re-exports
-│   ├── frame.rs            — Frame, Status, Data, ErrorCode trait
+│   ├── frame.rs            — Frame, Status, Data, ErrorCode, to_data()
+│   ├── kernel.rs           — Kernel builder: register(), subscribe(), start()
+│   ├── router.rs           — Router runtime: event loop, route_request/response/cancel
 │   ├── pipe.rs             — pipe(), PipeEnd, Caller, CallStream
-│   ├── kernel.rs           — Kernel struct, register(), subscribe(), start()
-│   ├── router.rs           — Routing logic: route_request, route_response, route_cancel
-│   ├── sigcall.rs          — SigcallRegistry
-│   ├── sender.rs           — FrameSender helper
 │   ├── syscall.rs          — Syscall trait
-│   ├── backpressure.rs     — StreamController
-│   ├── cancel.rs           — CancellationToken integration
+│   ├── sender.rs           — FrameSender helper
+│   ├── sigcall.rs          — SigcallRegistry
+│   ├── backpressure.rs     — StreamController, BackpressureConfig, SendOutcome
 │   └── error.rs            — KernelError, PipeError, SigcallError
 ```
 
