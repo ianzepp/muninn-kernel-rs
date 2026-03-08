@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::backpressure::{BackpressureConfig, StreamController};
+use crate::backpressure::{BackpressureConfig, StreamController, Subscriber};
 use crate::frame::{Frame, Status};
 use crate::pipe::{self, PipeEnd};
 use crate::router::Router;
@@ -167,24 +167,25 @@ impl Kernel {
 
     /// Subscribe to receive response frames routed through the kernel.
     ///
-    /// Returns a raw receiver channel. Must be called before [`start`](Kernel::start).
+    /// Returns a [`Subscriber`] that acknowledges frames as they are consumed.
+    /// Must be called before [`start`](Kernel::start).
     ///
     /// # Future: Subscriber type
     ///
-    /// Currently returns a bare `mpsc::Receiver<Frame>`. A future `Subscriber`
-    /// wrapper may provide:
+    /// Currently returns a lightweight [`Subscriber`] wrapper. A future version
+    /// may provide:
     /// - Filtering by `parent_id` or syscall prefix (connection-scoped delivery)
     /// - Typed deserialization helpers (`recv_as::<T>()`)
     /// - Backpressure acknowledgment signals back to the `StreamController`
     /// - Automatic reconnect/resubscribe on channel close
     ///
-    /// For now the raw receiver is sufficient. Gateway code should handle
-    /// filtering and serialization at the boundary layer.
-    pub fn subscribe(&mut self) -> mpsc::Receiver<Frame> {
+    /// For now the wrapper only adds backpressure acknowledgements. Gateway
+    /// code still handles filtering and serialization at the boundary layer.
+    pub fn subscribe(&mut self) -> Subscriber {
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-        self.subscribers
-            .push(StreamController::new(tx, self.backpressure.clone()));
-        rx
+        let controller = StreamController::new(tx, self.backpressure.clone());
+        self.subscribers.push(controller.clone());
+        Subscriber::new(rx, controller)
     }
 
     /// Start the kernel event loop. Consumes self.

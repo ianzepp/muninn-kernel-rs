@@ -24,7 +24,7 @@ pub mod sender;
 pub mod sigcall;
 pub mod syscall;
 
-pub use backpressure::{BackpressureConfig, SendOutcome, StreamController};
+pub use backpressure::{BackpressureConfig, SendOutcome, StreamController, Subscriber};
 pub use error::{KernelError, PipeError, SigcallError};
 pub use frame::{Data, ErrorCode, Frame, Status, to_data};
 pub use kernel::Kernel;

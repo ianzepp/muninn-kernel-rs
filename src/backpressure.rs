@@ -8,6 +8,7 @@
 //! is considered stalled.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,6 +79,7 @@ pub struct StreamController {
     tx: mpsc::Sender<Frame>,
     config: BackpressureConfig,
     counts: Arc<Mutex<StreamCounts>>,
+    paused: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl StreamController {
@@ -88,6 +90,7 @@ impl StreamController {
             tx,
             config,
             counts: Arc::new(Mutex::new(HashMap::new())),
+            paused: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -113,6 +116,7 @@ impl StreamController {
             // Always try to deliver terminal frames, then clean up
             let outcome = self.try_deliver(frame).await;
             self.remove_stream(stream_id);
+            self.resume_stream(stream_id);
             return outcome;
         }
 
@@ -126,6 +130,7 @@ impl StreamController {
 
         if outcome == SendOutcome::Delivered {
             self.increment(stream_id);
+            self.update_flow_state(stream_id);
         }
 
         outcome
@@ -135,6 +140,7 @@ impl StreamController {
     /// when the channel drains). For now, terminal frames reset the count.
     pub fn ack_stream(&self, stream_id: Uuid) {
         self.remove_stream(stream_id);
+        self.resume_stream(stream_id);
     }
 
     /// Get the current buffered count for a stream.
@@ -150,12 +156,39 @@ impl StreamController {
         &self.tx
     }
 
+    pub(crate) fn ack_frame(&self, frame: &Frame) {
+        let Some(stream_id) = frame.parent_id else {
+            return;
+        };
+
+        if frame.status.is_terminal() {
+            self.remove_stream(stream_id);
+            self.resume_stream(stream_id);
+            return;
+        }
+
+        self.decrement(stream_id);
+        self.update_flow_state(stream_id);
+    }
+
     // ── Internal ──
 
     fn flow_state(&self, stream_id: Uuid) -> FlowState {
-        let guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = guard.get(&stream_id).copied().unwrap_or(0);
-        if count >= self.config.high_watermark {
+        let count = self.buffered(stream_id);
+        let mut paused = self
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if paused.contains(&stream_id) {
+            if count <= self.config.low_watermark {
+                paused.remove(&stream_id);
+                FlowState::Flowing
+            } else {
+                FlowState::Paused
+            }
+        } else if count >= self.config.high_watermark {
+            paused.insert(stream_id);
             FlowState::Paused
         } else {
             FlowState::Flowing
@@ -167,9 +200,46 @@ impl StreamController {
         *guard.entry(stream_id).or_insert(0) += 1;
     }
 
+    fn decrement(&self, stream_id: Uuid) {
+        let mut guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(count) = guard.get_mut(&stream_id) else {
+            return;
+        };
+
+        if *count <= 1 {
+            guard.remove(&stream_id);
+        } else {
+            *count -= 1;
+        }
+    }
+
     fn remove_stream(&self, stream_id: Uuid) {
         let mut guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&stream_id);
+    }
+
+    fn update_flow_state(&self, stream_id: Uuid) {
+        let count = self.buffered(stream_id);
+        let mut paused = self
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if paused.contains(&stream_id) {
+            if count <= self.config.low_watermark {
+                paused.remove(&stream_id);
+            }
+        } else if count >= self.config.high_watermark {
+            paused.insert(stream_id);
+        }
+    }
+
+    fn resume_stream(&self, stream_id: Uuid) {
+        let mut paused = self
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        paused.remove(&stream_id);
     }
 
     /// Fast path: non-blocking `try_send`.
@@ -191,6 +261,25 @@ impl StreamController {
             Ok(Err(_)) => SendOutcome::Closed,
             Err(_) => SendOutcome::Stalled,
         }
+    }
+}
+
+/// Subscriber wrapper that acknowledges frames back to the stream controller.
+pub struct Subscriber {
+    rx: mpsc::Receiver<Frame>,
+    controller: StreamController,
+}
+
+impl Subscriber {
+    #[must_use]
+    pub fn new(rx: mpsc::Receiver<Frame>, controller: StreamController) -> Self {
+        Self { rx, controller }
+    }
+
+    pub async fn recv(&mut self) -> Option<Frame> {
+        let frame = self.rx.recv().await?;
+        self.controller.ack_frame(&frame);
+        Some(frame)
     }
 }
 

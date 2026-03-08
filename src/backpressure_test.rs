@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use crate::backpressure::{BackpressureConfig, SendOutcome, StreamController};
+use crate::backpressure::{BackpressureConfig, SendOutcome, StreamController, Subscriber};
 use crate::frame::{Frame, Status};
 
 fn small_config() -> BackpressureConfig {
@@ -200,4 +200,34 @@ async fn clone_shares_state() {
 
     // Clone sees the same count
     assert_eq!(ctrl2.buffered(req.id), 1);
+}
+
+#[tokio::test]
+async fn subscriber_recv_acks_and_resumes_below_low_watermark() {
+    let (tx, rx) = mpsc::channel(16);
+    let ctrl = StreamController::new(
+        tx,
+        BackpressureConfig {
+            high_watermark: 2,
+            low_watermark: 1,
+            stall_timeout: Duration::from_millis(100),
+        },
+    );
+    let mut subscriber = Subscriber::new(rx, ctrl.clone());
+
+    let req = Frame::request("test:op");
+
+    for _ in 0..3 {
+        let outcome = ctrl.send(&req.item(Default::default())).await;
+        assert_eq!(outcome, SendOutcome::Delivered);
+    }
+    assert_eq!(ctrl.buffered(req.id), 3);
+
+    subscriber.recv().await.unwrap();
+    subscriber.recv().await.unwrap();
+    assert_eq!(ctrl.buffered(req.id), 1);
+
+    let outcome = ctrl.send(&req.item(Default::default())).await;
+    assert_eq!(outcome, SendOutcome::Delivered);
+    assert_eq!(ctrl.buffered(req.id), 2);
 }
