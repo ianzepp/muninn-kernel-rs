@@ -8,18 +8,18 @@
 use std::collections::HashMap;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::backpressure::StreamController;
 use crate::error::KernelError;
 use crate::frame::{Frame, Status};
+use crate::kernel::CancelHook;
 use crate::sigcall::SigcallRegistry;
 
 /// Entry tracking an active (in-flight) request for cancel forwarding.
 struct ActiveEntry {
     subsystem_tx: mpsc::Sender<Frame>,
-    cancel: CancellationToken,
+    cancel_hook: Option<CancelHook>,
 }
 
 type PendingRoutes = HashMap<Uuid, Vec<StreamController>>;
@@ -29,6 +29,7 @@ type ActiveRequests = HashMap<Uuid, ActiveEntry>;
 /// and runs as a spawned task.
 pub(crate) struct Router {
     routes: HashMap<String, mpsc::Sender<Frame>>,
+    cancel_hooks: HashMap<String, CancelHook>,
     subscribers: Vec<StreamController>,
     sigcalls: SigcallRegistry,
     pending: PendingRoutes,
@@ -39,11 +40,13 @@ impl Router {
     /// Create a new router with the given routing state.
     pub(crate) fn new(
         routes: HashMap<String, mpsc::Sender<Frame>>,
+        cancel_hooks: HashMap<String, CancelHook>,
         subscribers: Vec<StreamController>,
         sigcalls: SigcallRegistry,
     ) -> Self {
         Self {
             routes,
+            cancel_hooks,
             subscribers,
             sigcalls,
             pending: HashMap::new(),
@@ -56,7 +59,7 @@ impl Router {
         while let Some(frame) = rx.recv().await {
             match frame.status {
                 Status::Request => self.route_request(&frame).await,
-                Status::Cancel => self.route_cancel(&frame),
+                Status::Cancel => self.route_cancel(&frame).await,
                 _ => self.route_response(&frame).await,
             }
         }
@@ -93,12 +96,11 @@ impl Router {
         );
 
         // Track active request for cancel forwarding
-        let cancel = CancellationToken::new();
         self.active.insert(
             frame.id,
             ActiveEntry {
                 subsystem_tx: subsystem_tx.clone(),
-                cancel,
+                cancel_hook: self.cancel_hooks.get(frame.prefix()).cloned(),
             },
         );
 
@@ -156,17 +158,31 @@ impl Router {
 
     // ── Cancel routing ──
 
-    fn route_cancel(&mut self, frame: &Frame) {
+    async fn route_cancel(&mut self, frame: &Frame) {
         let Some(target_id) = frame.parent_id else {
             return;
         };
 
         if let Some(entry) = self.active.remove(&target_id) {
-            entry.cancel.cancel();
+            if let Some(cancel_hook) = entry.cancel_hook {
+                cancel_hook(target_id);
+            }
             let _ = entry.subsystem_tx.try_send(frame.clone());
         }
 
-        self.pending.remove(&target_id);
+        let Some(controllers) = self.pending.remove(&target_id) else {
+            return;
+        };
+
+        let mut cancel_response = frame.clone();
+        cancel_response.id = Uuid::new_v4();
+        cancel_response.parent_id = Some(target_id);
+        cancel_response.status = Status::Cancel;
+        cancel_response.data.clear();
+
+        for ctrl in &controllers {
+            ctrl.send(&cancel_response).await;
+        }
     }
 
     // ── Inline sigcall management ──

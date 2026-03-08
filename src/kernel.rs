@@ -22,6 +22,8 @@ use crate::syscall::Syscall;
 
 const CHANNEL_BUFFER: usize = 256;
 
+pub(crate) type CancelHook = Arc<dyn Fn(Uuid) + Send + Sync>;
+
 /// The microkernel: registers subsystems, then starts a router event loop.
 ///
 /// # Usage
@@ -34,6 +36,7 @@ pub struct Kernel {
     inbound_tx: mpsc::Sender<Frame>,
     inbound_rx: Option<mpsc::Receiver<Frame>>,
     routes: HashMap<String, mpsc::Sender<Frame>>,
+    cancel_hooks: HashMap<String, CancelHook>,
     pipe_ends: Vec<(mpsc::Sender<Frame>, PipeEnd)>,
     subscribers: Vec<StreamController>,
     sigcalls: SigcallRegistry,
@@ -55,6 +58,7 @@ impl Kernel {
             inbound_tx,
             inbound_rx: Some(inbound_rx),
             routes: HashMap::new(),
+            cancel_hooks: HashMap::new(),
             pipe_ends: Vec::new(),
             subscribers: Vec::new(),
             sigcalls: SigcallRegistry::new(),
@@ -93,19 +97,29 @@ impl Kernel {
     pub fn register_syscall(&mut self, handler: Arc<dyn Syscall>) {
         let prefix = handler.prefix();
         let mut sub_end = self.register(prefix);
+        let active_tokens: Arc<Mutex<HashMap<Uuid, CancellationToken>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let cancel_tokens = Arc::clone(&active_tokens);
+
+        self.cancel_hooks.insert(
+            prefix.to_string(),
+            Arc::new(move |request_id| {
+                let mut guard = cancel_tokens
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(token) = guard.remove(&request_id) {
+                    token.cancel();
+                }
+            }),
+        );
 
         tokio::spawn(async move {
             let sender = FrameSender::new(sub_end.sender());
             let caller = sub_end.caller();
 
-            // Track active requests so Cancel frames can trigger tokens
-            let active_tokens: Arc<Mutex<HashMap<Uuid, CancellationToken>>> =
-                Arc::new(Mutex::new(HashMap::new()));
-
             while let Some(frame) = sub_end.recv().await {
                 match frame.status {
                     Status::Cancel => {
-                        // Trigger the token for the target request
                         if let Some(target_id) = frame.parent_id {
                             let mut guard = active_tokens
                                 .lock()
@@ -194,7 +208,12 @@ impl Kernel {
             });
         }
 
-        let mut router = Router::new(self.routes, self.subscribers, self.sigcalls);
+        let mut router = Router::new(
+            self.routes,
+            self.cancel_hooks,
+            self.subscribers,
+            self.sigcalls,
+        );
 
         tokio::spawn(async move {
             router.run(&mut inbound_rx).await;

@@ -361,6 +361,11 @@ async fn kernel_cancel_cleans_up_routing_state() {
     let cancel_received = sub_end.recv().await.unwrap();
     assert_eq!(cancel_received.status, Status::Cancel);
 
+    // Caller receives a terminal cancel immediately.
+    let cancelled = rx.recv().await.unwrap();
+    assert_eq!(cancelled.parent_id, Some(req_id));
+    assert_eq!(cancelled.status, Status::Cancel);
+
     // A subsequent response for this request should not reach subscribers
     // (pending was cleaned up). We verify by sending a new unrelated request
     // and checking that we receive its response, not a stale one.
@@ -404,6 +409,41 @@ async fn kernel_cancel_triggers_token_for_syscall_handler() {
     sender.send(cancel_frame).await.unwrap();
 
     // Give the handler time to observe cancellation
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(was_cancelled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn kernel_cancel_returns_terminal_frame_for_syscall_handler() {
+    let was_cancelled = Arc::new(AtomicBool::new(false));
+
+    let mut kernel = Kernel::new();
+    kernel.register_syscall(Arc::new(CancellableSyscall {
+        was_cancelled: Arc::clone(&was_cancelled),
+    }));
+    let mut rx = kernel.subscribe();
+    let sender = kernel.sender();
+
+    let _handle = kernel.start();
+
+    let req = Frame::request("slow:work");
+    let req_id = req.id;
+    sender.send(req).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let mut cancel_frame = Frame::request("slow:work");
+    cancel_frame.status = Status::Cancel;
+    cancel_frame.parent_id = Some(req_id);
+    sender.send(cancel_frame).await.unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("cancel should terminate the response stream")
+        .expect("subscriber channel should stay open");
+    assert_eq!(response.parent_id, Some(req_id));
+    assert_eq!(response.status, Status::Cancel);
+
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(was_cancelled.load(Ordering::SeqCst));
 }
