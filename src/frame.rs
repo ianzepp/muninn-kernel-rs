@@ -108,9 +108,8 @@ impl Frame {
     /// Serializes the value to a flat data map. If the value serializes to a
     /// JSON object, its fields become the data keys. Otherwise the value is
     /// stored under a `"value"` key.
-    #[must_use]
-    pub fn item_from<T: Serialize>(&self, value: &T) -> Self {
-        self.response(Status::Item, to_data(value))
+    pub fn item_from<T: Serialize>(&self, value: &T) -> Result<Self, serde_json::Error> {
+        Ok(self.response(Status::Item, to_data(value)?))
     }
 
     /// Build a bulk response correlated to this request.
@@ -120,9 +119,8 @@ impl Frame {
     }
 
     /// Build a bulk response from a serializable value.
-    #[must_use]
-    pub fn bulk_from<T: Serialize>(&self, value: &T) -> Self {
-        self.response(Status::Bulk, to_data(value))
+    pub fn bulk_from<T: Serialize>(&self, value: &T) -> Result<Self, serde_json::Error> {
+        Ok(self.response(Status::Bulk, to_data(value)?))
     }
 
     /// Build a done response correlated to this request.
@@ -138,9 +136,8 @@ impl Frame {
     }
 
     /// Build a done response from a serializable value.
-    #[must_use]
-    pub fn done_from<T: Serialize>(&self, value: &T) -> Self {
-        self.response(Status::Done, to_data(value))
+    pub fn done_from<T: Serialize>(&self, value: &T) -> Result<Self, serde_json::Error> {
+        Ok(self.response(Status::Done, to_data(value)?))
     }
 
     /// Build an error response correlated to this request.
@@ -196,11 +193,14 @@ impl Frame {
     ///
     /// Avoids requiring callers to import `serde_json::Value` or construct
     /// `Value` variants manually.
-    #[must_use]
-    pub fn with_field(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
-        let json = serde_json::to_value(value).unwrap_or(Value::Null);
+    pub fn with_field(
+        mut self,
+        key: impl Into<String>,
+        value: impl Serialize,
+    ) -> Result<Self, serde_json::Error> {
+        let json = serde_json::to_value(value)?;
         self.data.insert(key.into(), json);
-        self
+        Ok(self)
     }
 
     // ── Queries ──
@@ -239,16 +239,16 @@ impl Frame {
 ///
 /// If the value serializes to a JSON object, returns its fields.
 /// Otherwise wraps the value under a `"value"` key.
-pub fn to_data<T: Serialize>(value: &T) -> Data {
-    let json = serde_json::to_value(value).unwrap_or(Value::Null);
-    match json {
+pub fn to_data<T: Serialize>(value: &T) -> Result<Data, serde_json::Error> {
+    let json = serde_json::to_value(value)?;
+    Ok(match json {
         Value::Object(map) => map.into_iter().collect(),
         other => {
             let mut data = Data::new();
             data.insert("value".into(), other);
             data
         }
-    }
+    })
 }
 
 fn now_millis() -> i64 {

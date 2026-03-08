@@ -205,8 +205,11 @@ fn timestamp_is_positive() {
 fn with_field_serializes_primitives() {
     let f = Frame::request("test:op")
         .with_field("name", "alice")
+        .unwrap()
         .with_field("count", 42)
-        .with_field("active", true);
+        .unwrap()
+        .with_field("active", true)
+        .unwrap();
     assert_eq!(f.data.get("name").and_then(Value::as_str), Some("alice"));
     assert_eq!(f.data.get("count").and_then(Value::as_i64), Some(42));
     assert_eq!(
@@ -224,10 +227,12 @@ fn item_from_serializes_struct() {
     }
 
     let req = Frame::request("test:op");
-    let item = req.item_from(&Entry {
-        id: 1,
-        label: "hello".into(),
-    });
+    let item = req
+        .item_from(&Entry {
+            id: 1,
+            label: "hello".into(),
+        })
+        .unwrap();
     assert_eq!(item.status, Status::Item);
     assert_eq!(item.parent_id, Some(req.id));
     assert_eq!(item.data.get("id").and_then(Value::as_u64), Some(1));
@@ -240,7 +245,7 @@ fn item_from_serializes_struct() {
 #[test]
 fn item_from_wraps_non_object() {
     let req = Frame::request("test:op");
-    let item = req.item_from(&42);
+    let item = req.item_from(&42).unwrap();
     assert_eq!(item.data.get("value").and_then(Value::as_i64), Some(42));
 }
 
@@ -252,7 +257,7 @@ fn done_from_serializes_struct() {
     }
 
     let req = Frame::request("test:op");
-    let done = req.done_from(&Summary { total: 5 });
+    let done = req.done_from(&Summary { total: 5 }).unwrap();
     assert_eq!(done.status, Status::Done);
     assert!(done.status.is_terminal());
     assert_eq!(done.data.get("total").and_then(Value::as_u64), Some(5));
@@ -266,9 +271,46 @@ fn bulk_from_serializes_struct() {
     }
 
     let req = Frame::request("test:op");
-    let bulk = req.bulk_from(&Batch { count: 10 });
+    let bulk = req.bulk_from(&Batch { count: 10 }).unwrap();
     assert_eq!(bulk.status, Status::Bulk);
     assert_eq!(bulk.data.get("count").and_then(Value::as_u64), Some(10));
+}
+
+#[test]
+fn with_field_returns_serialize_error() {
+    struct FailingValue;
+
+    impl serde::Serialize for FailingValue {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("boom"))
+        }
+    }
+
+    let err = Frame::request("test:op")
+        .with_field("bad", FailingValue)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "boom");
+}
+
+#[test]
+fn item_from_returns_serialize_error() {
+    struct FailingValue;
+
+    impl serde::Serialize for FailingValue {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("boom"))
+        }
+    }
+
+    let req = Frame::request("test:op");
+    let err = req.item_from(&FailingValue).unwrap_err();
+    assert_eq!(err.to_string(), "boom");
 }
 
 #[test]

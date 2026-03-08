@@ -50,7 +50,11 @@ impl Syscall for StreamSyscall {
         _cancel: CancellationToken,
     ) -> Result<(), Box<dyn ErrorCode + Send>> {
         for i in 0..3 {
-            let _ = tx.send(frame.item_from(&serde_json::json!({"index": i}))).await;
+            let item = frame.item_from(&serde_json::json!({"index": i})).map_err(|err| {
+                Box::new(KernelError::internal(format!("failed to serialize item: {err}")))
+                    as Box<dyn ErrorCode + Send>
+            })?;
+            let _ = tx.send(item).await;
         }
         let _ = tx.send_done(frame).await;
         Ok(())

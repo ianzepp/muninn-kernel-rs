@@ -16,6 +16,17 @@ struct TestItem {
     count: u32,
 }
 
+struct FailingItem;
+
+impl Serialize for FailingItem {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(serde::ser::Error::custom("boom"))
+    }
+}
+
 #[derive(Debug)]
 struct TestError;
 impl std::fmt::Display for TestError {
@@ -205,4 +216,14 @@ async fn to_data_wraps_non_object_under_value_key() {
     let frame = rx.recv().await.unwrap();
 
     assert_eq!(frame.data.get("value").and_then(Value::as_u64), Some(42));
+}
+
+#[tokio::test]
+async fn send_item_returns_serialize_error() {
+    let (sender, mut rx) = setup();
+    let req = Frame::request("test:op");
+
+    let err = sender.send_item(&req, &FailingItem).await.unwrap_err();
+    assert_eq!(err.to_string(), "serialization failed: boom");
+    assert!(rx.try_recv().is_err());
 }

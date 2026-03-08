@@ -108,6 +108,8 @@ pub enum PipeError {
     Closed,
     #[error("send failed: channel full or closed")]
     SendFailed,
+    #[error("serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 /// Errors from sigcall registry operations.

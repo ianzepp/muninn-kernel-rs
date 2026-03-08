@@ -29,7 +29,7 @@ impl FrameSender {
 
     /// Send an item frame with serializable data.
     pub async fn send_item<T: Serialize>(&self, req: &Frame, value: &T) -> Result<(), PipeError> {
-        let data = to_data(value);
+        let data = to_data(value)?;
         self.send(req.item(data)).await
     }
 
