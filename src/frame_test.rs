@@ -202,6 +202,76 @@ fn timestamp_is_positive() {
 }
 
 #[test]
+fn with_field_serializes_primitives() {
+    let f = Frame::request("test:op")
+        .with_field("name", "alice")
+        .with_field("count", 42)
+        .with_field("active", true);
+    assert_eq!(f.data.get("name").and_then(Value::as_str), Some("alice"));
+    assert_eq!(f.data.get("count").and_then(Value::as_i64), Some(42));
+    assert_eq!(
+        f.data.get("active").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn item_from_serializes_struct() {
+    #[derive(serde::Serialize)]
+    struct Entry {
+        id: u32,
+        label: String,
+    }
+
+    let req = Frame::request("test:op");
+    let item = req.item_from(&Entry {
+        id: 1,
+        label: "hello".into(),
+    });
+    assert_eq!(item.status, Status::Item);
+    assert_eq!(item.parent_id, Some(req.id));
+    assert_eq!(item.data.get("id").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        item.data.get("label").and_then(Value::as_str),
+        Some("hello")
+    );
+}
+
+#[test]
+fn item_from_wraps_non_object() {
+    let req = Frame::request("test:op");
+    let item = req.item_from(&42);
+    assert_eq!(item.data.get("value").and_then(Value::as_i64), Some(42));
+}
+
+#[test]
+fn done_from_serializes_struct() {
+    #[derive(serde::Serialize)]
+    struct Summary {
+        total: u32,
+    }
+
+    let req = Frame::request("test:op");
+    let done = req.done_from(&Summary { total: 5 });
+    assert_eq!(done.status, Status::Done);
+    assert!(done.status.is_terminal());
+    assert_eq!(done.data.get("total").and_then(Value::as_u64), Some(5));
+}
+
+#[test]
+fn bulk_from_serializes_struct() {
+    #[derive(serde::Serialize)]
+    struct Batch {
+        count: u32,
+    }
+
+    let req = Frame::request("test:op");
+    let bulk = req.bulk_from(&Batch { count: 10 });
+    assert_eq!(bulk.status, Status::Bulk);
+    assert_eq!(bulk.data.get("count").and_then(Value::as_u64), Some(10));
+}
+
+#[test]
 fn frame_serde_round_trip() {
     let f = Frame::request("test:op")
         .with_from("user-1")

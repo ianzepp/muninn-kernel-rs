@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::frame::Frame;
+use crate::frame::{ErrorCode, Frame};
 use crate::pipe::Caller;
 use crate::sender::FrameSender;
 
@@ -19,6 +19,14 @@ use crate::sender::FrameSender;
 /// dispatch must produce exactly one terminal frame (`Done` or `Error`).
 /// Streaming responses emit zero or more `Item`/`Bulk` frames before the
 /// terminal.
+///
+/// # Error Handling
+///
+/// Returning `Err` causes the kernel to automatically send an error frame
+/// on behalf of the handler. This removes boilerplate for the common case
+/// where a single error terminates the stream. Handlers that need to send
+/// partial results before failing should use [`FrameSender`] directly and
+/// return `Ok(())`.
 ///
 /// # Cancellation
 ///
@@ -36,11 +44,14 @@ pub trait Syscall: Send + Sync {
     /// - `tx`: Sender for emitting response frames (Item, Done, Error).
     /// - `caller`: For making outbound calls to other subsystems through the kernel.
     /// - `cancel`: Triggered when the caller cancels this request.
+    ///
+    /// Return `Ok(())` after sending a terminal frame via `tx`, or return
+    /// `Err` to have the kernel send an error frame automatically.
     async fn dispatch(
         &self,
         frame: &Frame,
         tx: &FrameSender,
         caller: &Caller,
         cancel: CancellationToken,
-    );
+    ) -> Result<(), Box<dyn ErrorCode + Send>>;
 }

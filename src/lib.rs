@@ -26,7 +26,7 @@ pub mod syscall;
 
 pub use backpressure::{BackpressureConfig, SendOutcome, StreamController};
 pub use error::{KernelError, PipeError, SigcallError};
-pub use frame::{Data, ErrorCode, Frame, Status};
+pub use frame::{Data, ErrorCode, Frame, Status, to_data};
 pub use kernel::Kernel;
 pub use pipe::{CallStream, Caller, PipeEnd, pipe, pipe_default};
 pub use sender::FrameSender;

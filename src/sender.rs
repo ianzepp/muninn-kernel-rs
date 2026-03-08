@@ -1,11 +1,10 @@
 //! `FrameSender` — helper for sending response frames with common patterns.
 
 use serde::Serialize;
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::error::PipeError;
-use crate::frame::{Data, ErrorCode, Frame};
+use crate::frame::{ErrorCode, Frame, to_data};
 
 /// Helper for sending response frames through a channel.
 ///
@@ -98,22 +97,6 @@ impl FrameSender {
         match result {
             Ok(()) => self.send_done(req).await,
             Err(e) => self.send_error_from(req, &e).await,
-        }
-    }
-}
-
-/// Convert a serializable value into a flat `Data` map.
-///
-/// If the value serializes to a JSON object, returns its fields.
-/// Otherwise wraps the value under a `"value"` key.
-fn to_data<T: Serialize>(value: &T) -> Data {
-    let json = serde_json::to_value(value).unwrap_or(Value::Null);
-    match json {
-        Value::Object(map) => map.into_iter().collect(),
-        other => {
-            let mut data = Data::new();
-            data.insert("value".into(), other);
-            data
         }
     }
 }

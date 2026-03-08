@@ -132,7 +132,12 @@ impl Kernel {
 
                         let request_id = frame.id;
                         tokio::spawn(async move {
-                            handler.dispatch(&frame, &sender, &caller, cancel).await;
+                            let result =
+                                handler.dispatch(&frame, &sender, &caller, cancel).await;
+                            // Auto-send error frame if handler returned Err
+                            if let Err(err) = result {
+                                let _ = sender.send(frame.error_from(&*err)).await;
+                            }
                             // Clean up token on completion
                             let mut guard = tokens
                                 .lock()
@@ -148,7 +153,19 @@ impl Kernel {
 
     /// Subscribe to receive response frames routed through the kernel.
     ///
-    /// Returns a receiver channel. Must be called before [`start`](Kernel::start).
+    /// Returns a raw receiver channel. Must be called before [`start`](Kernel::start).
+    ///
+    /// # Future: Subscriber type
+    ///
+    /// Currently returns a bare `mpsc::Receiver<Frame>`. A future `Subscriber`
+    /// wrapper may provide:
+    /// - Filtering by `parent_id` or syscall prefix (connection-scoped delivery)
+    /// - Typed deserialization helpers (`recv_as::<T>()`)
+    /// - Backpressure acknowledgment signals back to the `StreamController`
+    /// - Automatic reconnect/resubscribe on channel close
+    ///
+    /// For now the raw receiver is sufficient. Gateway code should handle
+    /// filtering and serialization at the boundary layer.
     pub fn subscribe(&mut self) -> mpsc::Receiver<Frame> {
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
         self.subscribers

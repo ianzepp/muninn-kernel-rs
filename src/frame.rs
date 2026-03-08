@@ -103,10 +103,26 @@ impl Frame {
         self.response(Status::Item, data)
     }
 
+    /// Build an item response from a serializable value.
+    ///
+    /// Serializes the value to a flat data map. If the value serializes to a
+    /// JSON object, its fields become the data keys. Otherwise the value is
+    /// stored under a `"value"` key.
+    #[must_use]
+    pub fn item_from<T: Serialize>(&self, value: &T) -> Self {
+        self.response(Status::Item, to_data(value))
+    }
+
     /// Build a bulk response correlated to this request.
     #[must_use]
     pub fn bulk(&self, data: Data) -> Self {
         self.response(Status::Bulk, data)
+    }
+
+    /// Build a bulk response from a serializable value.
+    #[must_use]
+    pub fn bulk_from<T: Serialize>(&self, value: &T) -> Self {
+        self.response(Status::Bulk, to_data(value))
     }
 
     /// Build a done response correlated to this request.
@@ -121,6 +137,12 @@ impl Frame {
         self.response(Status::Done, data)
     }
 
+    /// Build a done response from a serializable value.
+    #[must_use]
+    pub fn done_from<T: Serialize>(&self, value: &T) -> Self {
+        self.response(Status::Done, to_data(value))
+    }
+
     /// Build an error response correlated to this request.
     #[must_use]
     pub fn error(&self, message: impl Into<String>) -> Self {
@@ -133,7 +155,7 @@ impl Frame {
 
     /// Build an error response from an [`ErrorCode`] implementor.
     #[must_use]
-    pub fn error_from(&self, err: &impl ErrorCode) -> Self {
+    pub fn error_from(&self, err: &(impl ErrorCode + ?Sized)) -> Self {
         let mut data = HashMap::new();
         data.insert("code".into(), Value::String(err.error_code().into()));
         data.insert("message".into(), Value::String(err.to_string()));
@@ -163,10 +185,21 @@ impl Frame {
         self
     }
 
-    /// Set a single key-value pair in `data`.
+    /// Set a single key-value pair in `data` using a raw `Value`.
     #[must_use]
     pub fn with_data(mut self, key: impl Into<String>, value: Value) -> Self {
         self.data.insert(key.into(), value);
+        self
+    }
+
+    /// Set a single key-value pair in `data` from a serializable value.
+    ///
+    /// Avoids requiring callers to import `serde_json::Value` or construct
+    /// `Value` variants manually.
+    #[must_use]
+    pub fn with_field(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
+        let json = serde_json::to_value(value).unwrap_or(Value::Null);
+        self.data.insert(key.into(), json);
         self
     }
 
@@ -198,6 +231,22 @@ impl Frame {
             status,
             trace: self.trace.clone(),
             data,
+        }
+    }
+}
+
+/// Convert a serializable value into a flat `Data` map.
+///
+/// If the value serializes to a JSON object, returns its fields.
+/// Otherwise wraps the value under a `"value"` key.
+pub fn to_data<T: Serialize>(value: &T) -> Data {
+    let json = serde_json::to_value(value).unwrap_or(Value::Null);
+    match json {
+        Value::Object(map) => map.into_iter().collect(),
+        other => {
+            let mut data = Data::new();
+            data.insert("value".into(), other);
+            data
         }
     }
 }

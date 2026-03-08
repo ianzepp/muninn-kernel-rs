@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::frame::{Frame, Status};
+use crate::error::KernelError;
+use crate::frame::{ErrorCode, Frame, Status};
 use crate::kernel::Kernel;
 use crate::pipe::Caller;
 use crate::sender::FrameSender;
@@ -26,8 +27,9 @@ impl Syscall for EchoSyscall {
         tx: &FrameSender,
         _caller: &Caller,
         _cancel: CancellationToken,
-    ) {
+    ) -> Result<(), Box<dyn ErrorCode + Send>> {
         let _ = tx.send_done(frame).await;
+        Ok(())
     }
 }
 
@@ -46,13 +48,56 @@ impl Syscall for StreamSyscall {
         tx: &FrameSender,
         _caller: &Caller,
         _cancel: CancellationToken,
-    ) {
+    ) -> Result<(), Box<dyn ErrorCode + Send>> {
         for i in 0..3 {
-            let mut data = crate::frame::Data::new();
-            data.insert("index".into(), serde_json::Value::from(i));
-            let _ = tx.send(frame.item(data)).await;
+            let _ = tx.send(frame.item_from(&serde_json::json!({"index": i}))).await;
         }
         let _ = tx.send_done(frame).await;
+        Ok(())
+    }
+}
+
+/// A syscall that always returns an error via Result.
+struct FailingSyscall;
+
+#[async_trait]
+impl Syscall for FailingSyscall {
+    fn prefix(&self) -> &'static str {
+        "fail"
+    }
+
+    async fn dispatch(
+        &self,
+        _frame: &Frame,
+        _tx: &FrameSender,
+        _caller: &Caller,
+        _cancel: CancellationToken,
+    ) -> Result<(), Box<dyn ErrorCode + Send>> {
+        Err(Box::new(KernelError::not_found("thing not found")))
+    }
+}
+
+/// A syscall that blocks until cancelled, then records that cancellation happened.
+struct CancellableSyscall {
+    was_cancelled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Syscall for CancellableSyscall {
+    fn prefix(&self) -> &'static str {
+        "slow"
+    }
+
+    async fn dispatch(
+        &self,
+        _frame: &Frame,
+        _tx: &FrameSender,
+        _caller: &Caller,
+        cancel: CancellationToken,
+    ) -> Result<(), Box<dyn ErrorCode + Send>> {
+        cancel.cancelled().await;
+        self.was_cancelled.store(true, Ordering::SeqCst);
+        Err(Box::new(KernelError::cancelled()))
     }
 }
 
@@ -194,6 +239,32 @@ async fn kernel_register_syscall_streams() {
 }
 
 #[tokio::test]
+async fn kernel_register_syscall_auto_sends_error_on_err_result() {
+    let mut kernel = Kernel::new();
+    kernel.register_syscall(Arc::new(FailingSyscall));
+    let mut rx = kernel.subscribe();
+    let sender = kernel.sender();
+
+    let _handle = kernel.start();
+
+    let req = Frame::request("fail:something");
+    let req_id = req.id;
+    sender.send(req).await.unwrap();
+
+    let response = rx.recv().await.unwrap();
+    assert_eq!(response.parent_id, Some(req_id));
+    assert_eq!(response.status, Status::Error);
+    assert_eq!(
+        response.data.get("code").and_then(|v| v.as_str()),
+        Some("E_NOT_FOUND")
+    );
+    assert_eq!(
+        response.data.get("message").and_then(|v| v.as_str()),
+        Some("E_NOT_FOUND: thing not found")
+    );
+}
+
+#[tokio::test]
 async fn kernel_sigcall_routes_to_registered_handler() {
     let mut kernel = Kernel::new();
     let mut rx = kernel.subscribe();
@@ -302,31 +373,6 @@ async fn kernel_cancel_cleans_up_routing_state() {
 
     let response = rx.recv().await.unwrap();
     assert_eq!(response.parent_id, Some(req2_id));
-}
-
-/// A syscall that blocks until cancelled, then records that cancellation happened.
-struct CancellableSyscall {
-    was_cancelled: Arc<AtomicBool>,
-}
-
-#[async_trait]
-impl Syscall for CancellableSyscall {
-    fn prefix(&self) -> &'static str {
-        "slow"
-    }
-
-    async fn dispatch(
-        &self,
-        frame: &Frame,
-        tx: &FrameSender,
-        _caller: &Caller,
-        cancel: CancellationToken,
-    ) {
-        // Wait for cancellation
-        cancel.cancelled().await;
-        self.was_cancelled.store(true, Ordering::SeqCst);
-        let _ = tx.send_error(frame, "cancelled").await;
-    }
 }
 
 #[tokio::test]
