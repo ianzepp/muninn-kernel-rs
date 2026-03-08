@@ -470,3 +470,31 @@ async fn kernel_stays_responsive_when_a_subsystem_queue_is_full() {
     assert!(saw_overflow);
     assert!(saw_ok_done);
 }
+
+#[tokio::test]
+async fn kernel_returns_error_when_a_registered_route_is_closed() {
+    let mut kernel = Kernel::new();
+    let sub_end = kernel.register("closed");
+    let mut rx = kernel.subscribe();
+    let sender = kernel.sender();
+
+    drop(sub_end);
+
+    let _handle = kernel.start();
+
+    let req = Frame::request("closed:work");
+    let req_id = req.id;
+    sender.send(req).await.unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("closed route should fail fast")
+        .expect("subscriber channel should stay open");
+
+    assert_eq!(response.parent_id, Some(req_id));
+    assert_eq!(response.status, Status::Error);
+    assert_eq!(
+        response.data.get("code").and_then(|value| value.as_str()),
+        Some("E_NO_ROUTE")
+    );
+}
