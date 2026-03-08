@@ -39,7 +39,7 @@ Callers
   │
   ▼ Frame::request("prefix:verb")
 Kernel (builder)
-  │  register_syscall(), register(), subscribe(), sender()
+  │  register_call(), register(), subscribe(), sender()
   │
   ▼ start()
 Router (single async task)
@@ -51,7 +51,7 @@ Router (single async task)
 
 **One event loop, no locks.** The router runs on a single task with plain `HashMap` state. This makes it easy to reason about and eliminates deadlocks.
 
-**Prefix-based dispatch.** The syscall string `"prefix:verb"` is split at the first colon. The router does an O(1) lookup by prefix to find the right handler.
+**Prefix-based dispatch.** The call string `"prefix:verb"` is split at the first colon. The router does an O(1) lookup by prefix to find the right handler.
 
 **Message-pure.** Frames are Rust structs moved through channels. Serialization happens only at the transport boundary, not inside the kernel.
 
@@ -65,9 +65,10 @@ Router (single async task)
 pub struct Frame {
     pub id: Uuid,
     pub parent_id: Option<Uuid>,
-    pub ts: i64,
+    pub created_ms: i64,
+    pub expires_in: i64,
     pub from: Option<String>,
-    pub syscall: String,
+    pub call: String,
     pub status: Status,
     pub trace: serde_json::Value,
     pub data: Data,  // HashMap<String, serde_json::Value>
@@ -123,7 +124,7 @@ let req = Frame::request("vfs:read")
 let mut kernel = Kernel::new();
 
 // Register a typed handler
-kernel.register_syscall(Arc::new(MyHandler));
+kernel.register_call(Arc::new(MyHandler));
 
 // Register a raw subsystem and get a PipeEnd
 let pipe_end = kernel.register("prefix");
@@ -264,7 +265,7 @@ The sigcall registry allows external handlers to register at runtime — useful 
 ```rust
 let sigcalls = kernel.sigcalls();
 
-// Register a handler channel for a specific syscall
+// Register a handler channel for a specific call
 let (tx, mut rx) = tokio::sync::mpsc::channel(256);
 sigcalls.register("room:create", "conn-abc123", tx)?;
 
@@ -365,9 +366,9 @@ async fn main() {
     let mut kernel = Kernel::new();
 
     // Register subsystems
-    kernel.register_syscall(Arc::new(VfsHandler));
-    kernel.register_syscall(Arc::new(EmsHandler));
-    kernel.register_syscall(Arc::new(RoomHandler));
+    kernel.register_call(Arc::new(VfsHandler));
+    kernel.register_call(Arc::new(EmsHandler));
+    kernel.register_call(Arc::new(RoomHandler));
 
     // Create a subscriber for outbound delivery
     let mut subscriber = kernel.subscribe();
@@ -412,7 +413,7 @@ Convert between them at the gateway boundary. If multiple projects share the sam
 | `kernel` | `Kernel` builder and registration API |
 | `router` | Router event loop (internal, not public) |
 | `pipe` | `PipeEnd`, `Caller`, `CallStream` |
-| `syscall` | `Syscall` trait |
+| `call` | `Syscall` trait |
 | `sender` | `FrameSender` response helpers |
 | `backpressure` | `BackpressureConfig`, `StreamController`, `Subscriber`, `SendOutcome` |
 | `sigcall` | `SigcallRegistry`, `SigcallError` |

@@ -4,7 +4,7 @@ use super::*;
 fn request_creates_frame_with_correct_status() {
     let f = Frame::request("vfs:read");
     assert_eq!(f.status, Status::Request);
-    assert_eq!(f.syscall, "vfs:read");
+    assert_eq!(f.call, "vfs:read");
     assert!(f.parent_id.is_none());
     assert!(f.from.is_none());
     assert!(f.data.is_empty());
@@ -27,7 +27,7 @@ fn item_response_correlates_to_request() {
     let item = req.item(HashMap::new());
     assert_eq!(item.parent_id, Some(req.id));
     assert_eq!(item.status, Status::Item);
-    assert_eq!(item.syscall, "vfs:read");
+    assert_eq!(item.call, "vfs:read");
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn response_gets_own_unique_id() {
 #[test]
 fn timestamp_is_positive() {
     let f = Frame::request("test:op");
-    assert!(f.ts > 0);
+    assert!(f.created_ms > 0);
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn frame_serde_round_trip() {
     let json = serde_json::to_string(&f).expect("serialize");
     let restored: Frame = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(restored.id, f.id);
-    assert_eq!(restored.syscall, f.syscall);
+    assert_eq!(restored.call, f.call);
     assert_eq!(restored.status, f.status);
     assert_eq!(restored.from, f.from);
     assert_eq!(restored.data.get("count"), f.data.get("count"));

@@ -115,7 +115,7 @@ impl Router {
 
     // ── Request routing ──
     //
-    // Handles the entry point for all new syscall invocations. Responsible for
+    // Handles the entry point for all new call invocations. Responsible for
     // resolving the destination subsystem and recording routing state so that
     // subsequent response and cancel frames can be delivered correctly.
 
@@ -134,11 +134,11 @@ impl Router {
             .routes
             .get(frame.prefix())
             .cloned()
-            .or_else(|| self.sigcalls.lookup(&frame.syscall));
+            .or_else(|| self.sigcalls.lookup(&frame.call));
 
         let Some(subsystem_tx) = subsystem_tx else {
             let err =
-                KernelError::no_route(format!("no handler for syscall: {}", frame.syscall));
+                KernelError::no_route(format!("no handler for call: {}", frame.call));
             let error_frame = frame.error_from(&err);
             self.deliver_to_subscribers(&error_frame).await;
             return;
@@ -172,8 +172,8 @@ impl Router {
                 self.active.remove(&frame.id);
 
                 let err = KernelError::timeout(format!(
-                    "subsystem queue full for syscall: {}",
-                    frame.syscall
+                    "subsystem queue full for call: {}",
+                    frame.call
                 ));
                 self.deliver_to_subscribers(&frame.error_from(&err)).await;
             }
@@ -182,8 +182,8 @@ impl Router {
                 self.active.remove(&frame.id);
 
                 let err = KernelError::no_route(format!(
-                    "handler unavailable for syscall: {}",
-                    frame.syscall
+                    "handler unavailable for call: {}",
+                    frame.call
                 ));
                 self.deliver_to_subscribers(&frame.error_from(&err)).await;
             }

@@ -122,7 +122,7 @@ async fn kernel_routes_request_to_registered_subsystem() {
     // Subsystem receives it
     let received = sub_end.recv().await.unwrap();
     assert_eq!(received.id, req_id);
-    assert_eq!(received.syscall, "test:ping");
+    assert_eq!(received.call, "test:ping");
 
     // Subsystem responds
     sub_end.sender().send(received.done()).await.unwrap();

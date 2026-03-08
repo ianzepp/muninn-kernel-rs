@@ -12,7 +12,7 @@ async fn pipe_send_and_recv() {
     let received = end_b.recv().await.unwrap();
 
     assert_eq!(received.id, id);
-    assert_eq!(received.syscall, "test:ping");
+    assert_eq!(received.call, "test:ping");
 }
 
 #[tokio::test]
@@ -127,7 +127,7 @@ async fn caller_send_fire_and_forget() {
     caller.send(frame).await.unwrap();
 
     let received = end_b.recv().await.unwrap();
-    assert_eq!(received.syscall, "test:broadcast");
+    assert_eq!(received.call, "test:broadcast");
 }
 
 #[tokio::test]
@@ -141,7 +141,7 @@ async fn unmatched_frames_go_to_recv() {
 
     // Should be available via recv()
     let received = end_a.recv().await.unwrap();
-    assert_eq!(received.syscall, "test:inbound");
+    assert_eq!(received.call, "test:inbound");
 }
 
 #[tokio::test]
@@ -177,5 +177,5 @@ async fn pipe_default_works() {
     end_a.sender().send(frame).await.unwrap();
 
     let received = end_b.recv().await.unwrap();
-    assert_eq!(received.syscall, "test:default");
+    assert_eq!(received.call, "test:default");
 }

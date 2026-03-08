@@ -44,7 +44,7 @@ pub trait ErrorCode: std::fmt::Display {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    /// Initiates a syscall.
+    /// Initiates a call.
     Request,
     /// Single streaming result (non-terminal).
     Item,
@@ -73,12 +73,15 @@ pub struct Frame {
     pub id: Uuid,
     /// Correlates response frames to the originating request.
     pub parent_id: Option<Uuid>,
-    /// Milliseconds since Unix epoch.
-    pub ts: i64,
+    /// Milliseconds since the Unix epoch when the frame was created.
+    pub created_ms: i64,
+    /// Milliseconds from `created_ms` after which this frame should be considered expired.
+    /// Zero means no expiration.
+    pub expires_in: i64,
     /// Sender identity (user ID, subsystem label, actor name).
     pub from: Option<String>,
-    /// Namespaced operation: `"prefix:verb"`.
-    pub syscall: String,
+    /// Namespaced call name used for routing: `"prefix:verb"`.
+    pub call: String,
     /// Lifecycle position.
     pub status: Status,
     /// Observability metadata (room, span, timing), separate from payload.
@@ -94,13 +97,14 @@ impl Frame {
 
     /// Create a new request frame.
     #[must_use]
-    pub fn request(syscall: impl Into<String>) -> Self {
+    pub fn request(call: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
             parent_id: None,
-            ts: now_millis(),
+            created_ms: now_millis(),
+            expires_in: 0,
             from: None,
-            syscall: syscall.into(),
+            call: call.into(),
             status: Status::Request,
             trace: None,
             data: HashMap::new(),
@@ -109,8 +113,8 @@ impl Frame {
 
     /// Create a new request frame with data.
     #[must_use]
-    pub fn request_with(syscall: impl Into<String>, data: Data) -> Self {
-        let mut frame = Self::request(syscall);
+    pub fn request_with(call: impl Into<String>, data: Data) -> Self {
+        let mut frame = Self::request(call);
         frame.data = data;
         frame
     }
@@ -225,18 +229,18 @@ impl Frame {
 
     // ── Queries ──
 
-    /// Extract the syscall prefix (e.g., `"vfs:read"` → `"vfs"`).
+    /// Extract the call prefix (e.g., `"vfs:read"` → `"vfs"`).
     #[must_use]
     pub fn prefix(&self) -> &str {
-        self.syscall
+        self.call
             .split_once(':')
-            .map_or(&self.syscall, |(prefix, _)| prefix)
+            .map_or(&self.call, |(prefix, _)| prefix)
     }
 
-    /// Extract the syscall verb (e.g., `"vfs:read"` → `"read"`).
+    /// Extract the call verb (e.g., `"vfs:read"` → `"read"`).
     #[must_use]
     pub fn verb(&self) -> &str {
-        self.syscall.split_once(':').map_or("", |(_, verb)| verb)
+        self.call.split_once(':').map_or("", |(_, verb)| verb)
     }
 
     // ── Internal ──
@@ -258,9 +262,10 @@ impl Frame {
         Self {
             id: Uuid::new_v4(),
             parent_id: Some(self.id),
-            ts: now_millis(),
+            created_ms: now_millis(),
+            expires_in: 0,
             from: None,
-            syscall: self.syscall.clone(),
+            call: self.call.clone(),
             status,
             trace: self.trace.clone(),
             data,
