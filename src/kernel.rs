@@ -97,26 +97,55 @@ impl Kernel {
     pub fn register_syscall(&mut self, handler: Arc<dyn Syscall>) {
         let prefix = handler.prefix();
         let mut sub_end = self.register(prefix);
-        let inbound_tx = self.inbound_tx.clone();
 
         tokio::spawn(async move {
             let sender = FrameSender::new(sub_end.sender());
             let caller = sub_end.caller();
 
+            // Track active requests so Cancel frames can trigger tokens
+            let active_tokens: Arc<Mutex<HashMap<Uuid, CancellationToken>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
             while let Some(frame) = sub_end.recv().await {
-                if frame.status != Status::Request {
-                    continue;
+                match frame.status {
+                    Status::Cancel => {
+                        // Trigger the token for the target request
+                        if let Some(target_id) = frame.parent_id {
+                            let mut guard = active_tokens
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(token) = guard.remove(&target_id) {
+                                token.cancel();
+                            }
+                        }
+                    }
+                    Status::Request => {
+                        let handler = Arc::clone(&handler);
+                        let sender = sender.clone();
+                        let caller = caller.clone();
+                        let cancel = CancellationToken::new();
+                        let tokens = Arc::clone(&active_tokens);
+
+                        // Store token so Cancel frames can find it
+                        {
+                            let mut guard = tokens
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard.insert(frame.id, cancel.clone());
+                        }
+
+                        let request_id = frame.id;
+                        tokio::spawn(async move {
+                            handler.dispatch(&frame, &sender, &caller, cancel).await;
+                            // Clean up token on completion
+                            let mut guard = tokens
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard.remove(&request_id);
+                        });
+                    }
+                    _ => {} // Responses are handled by the pipe dispatcher
                 }
-
-                let handler = Arc::clone(&handler);
-                let sender = sender.clone();
-                let caller = caller.clone();
-                let cancel = CancellationToken::new();
-                let _inbound_tx = inbound_tx.clone();
-
-                tokio::spawn(async move {
-                    handler.dispatch(&frame, &sender, &caller, cancel).await;
-                });
             }
         });
     }

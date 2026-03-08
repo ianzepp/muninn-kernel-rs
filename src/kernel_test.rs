@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -301,4 +302,62 @@ async fn kernel_cancel_cleans_up_routing_state() {
 
     let response = rx.recv().await.unwrap();
     assert_eq!(response.parent_id, Some(req2_id));
+}
+
+/// A syscall that blocks until cancelled, then records that cancellation happened.
+struct CancellableSyscall {
+    was_cancelled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Syscall for CancellableSyscall {
+    fn prefix(&self) -> &'static str {
+        "slow"
+    }
+
+    async fn dispatch(
+        &self,
+        frame: &Frame,
+        tx: &FrameSender,
+        _caller: &Caller,
+        cancel: CancellationToken,
+    ) {
+        // Wait for cancellation
+        cancel.cancelled().await;
+        self.was_cancelled.store(true, Ordering::SeqCst);
+        let _ = tx.send_error(frame, "cancelled").await;
+    }
+}
+
+#[tokio::test]
+async fn kernel_cancel_triggers_token_for_syscall_handler() {
+    let was_cancelled = Arc::new(AtomicBool::new(false));
+
+    let mut kernel = Kernel::new();
+    kernel.register_syscall(Arc::new(CancellableSyscall {
+        was_cancelled: Arc::clone(&was_cancelled),
+    }));
+    let _rx = kernel.subscribe();
+    let sender = kernel.sender();
+
+    let _handle = kernel.start();
+
+    // Send a request that will block until cancelled
+    let req = Frame::request("slow:work");
+    let req_id = req.id;
+    sender.send(req).await.unwrap();
+
+    // Give the handler time to start
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!was_cancelled.load(Ordering::SeqCst));
+
+    // Send cancel
+    let mut cancel_frame = Frame::request("slow:work");
+    cancel_frame.status = Status::Cancel;
+    cancel_frame.parent_id = Some(req_id);
+    sender.send(cancel_frame).await.unwrap();
+
+    // Give the handler time to observe cancellation
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(was_cancelled.load(Ordering::SeqCst));
 }
