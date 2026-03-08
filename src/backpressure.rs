@@ -1,11 +1,42 @@
 //! Watermark-based backpressure for subscriber delivery.
 //!
 //! A [`StreamController`] wraps an `mpsc::Sender<Frame>` and applies flow
-//! control per response stream (keyed by `parent_id`). When the number of
+//! control per response stream, keyed by `parent_id`. When the number of
 //! in-flight frames for a stream exceeds `high_watermark`, the controller
 //! switches from non-blocking `try_send` to blocking `send` with a stall
-//! timeout. If the consumer doesn't drain within `stall_timeout`, the stream
-//! is considered stalled.
+//! timeout. If the consumer doesn't drain within `stall_timeout`, delivery
+//! returns [`SendOutcome::Stalled`] and the caller can decide to cancel.
+//!
+//! # Flow State Machine
+//!
+//! Each stream transitions between two states:
+//!
+//! ```text
+//! Flowing ──(count >= high_watermark)──► Paused
+//!         ◄──(count <= low_watermark)─── Paused
+//! ```
+//!
+//! - **Flowing**: `try_send` is used. Falls back to `blocking_deliver` if the
+//!   channel is momentarily full, but the stream stays in `Flowing` state.
+//! - **Paused**: `blocking_deliver` is used with `stall_timeout`. The stream
+//!   remains `Paused` until the buffered count drops to or below `low_watermark`.
+//!
+//! The hysteresis gap between high and low watermarks prevents rapid oscillation
+//! between states when a consumer is draining near the threshold.
+//!
+//! # Where Applied
+//!
+//! Backpressure is applied between the router and external subscribers (gateway
+//! connections). It is **not** applied between the kernel and built-in subsystems,
+//! which are trusted co-located code expected to drain quickly.
+//!
+//! # TRADE-OFFS
+//!
+//! Per-stream counting requires a `Mutex`-protected `HashMap` inside the
+//! `StreamController`. This adds lock contention on every frame send and ack.
+//! The alternative — a single global buffer depth per subscriber — would be
+//! simpler but would allow one slow stream to trigger backpressure for unrelated
+//! streams sharing the same subscriber.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -48,15 +79,23 @@ impl Default for BackpressureConfig {
 }
 
 /// Per-stream flow state.
+///
+/// Determines which delivery path is used for non-terminal frames. Transitions
+/// are driven by the buffered frame count relative to the watermarks; see the
+/// module-level state machine diagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlowState {
-    /// Fast path: use `try_send`.
+    /// Fast path: use `try_send`. Falls back to blocking if the channel is full.
     Flowing,
-    /// Slow path: use send with timeout.
+    /// Slow path: use `send` with `stall_timeout`. Active above `high_watermark`
+    /// until the count drops to or below `low_watermark`.
     Paused,
 }
 
 /// Tracks buffered frame counts per response stream (by `parent_id`).
+///
+/// Each entry is incremented when a non-terminal frame is delivered and
+/// decremented when `Subscriber::recv` acknowledges a frame via `ack_frame`.
 type StreamCounts = HashMap<Uuid, usize>;
 
 /// Result of a send attempt through the controller.
@@ -156,12 +195,23 @@ impl StreamController {
         &self.tx
     }
 
+    /// Acknowledge consumption of a frame, adjusting the buffered count.
+    ///
+    /// Called by [`Subscriber::recv`] after each frame is returned to the caller.
+    /// Decrementing the count here (rather than on send) models actual consumer
+    /// progress: a frame is "unbuffered" only when the application has received it,
+    /// not when the channel has accepted it.
     pub(crate) fn ack_frame(&self, frame: &Frame) {
         let Some(stream_id) = frame.parent_id else {
+            // Frames without parent_id (e.g., unattributed broadcasts) are not
+            // tracked — no count to decrement.
             return;
         };
 
         if frame.status.is_terminal() {
+            // WHY: Terminal frames close the stream entirely. Clear both the
+            // count and the paused flag so a future stream with the same ID
+            // (unlikely but possible with UUID reuse) starts fresh.
             self.remove_stream(stream_id);
             self.resume_stream(stream_id);
             return;
@@ -173,6 +223,10 @@ impl StreamController {
 
     // ── Internal ──
 
+    /// Determine the current flow state for a stream, applying hysteresis.
+    ///
+    /// Reads both the buffered count and the paused set atomically (under the
+    /// paused lock) to avoid TOCTOU races between checking count and reading state.
     fn flow_state(&self, stream_id: Uuid) -> FlowState {
         let count = self.buffered(stream_id);
         let mut paused = self
@@ -182,12 +236,14 @@ impl StreamController {
 
         if paused.contains(&stream_id) {
             if count <= self.config.low_watermark {
+                // Consumer has drained enough — exit paused state
                 paused.remove(&stream_id);
                 FlowState::Flowing
             } else {
                 FlowState::Paused
             }
         } else if count >= self.config.high_watermark {
+            // Buffer is full — enter paused state
             paused.insert(stream_id);
             FlowState::Paused
         } else {
@@ -200,6 +256,8 @@ impl StreamController {
         *guard.entry(stream_id).or_insert(0) += 1;
     }
 
+    /// Decrement the buffered count for a stream. Removes the entry when it
+    /// reaches zero to avoid keeping empty entries across long-lived sessions.
     fn decrement(&self, stream_id: Uuid) {
         let mut guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(count) = guard.get_mut(&stream_id) else {
@@ -218,6 +276,10 @@ impl StreamController {
         guard.remove(&stream_id);
     }
 
+    /// Synchronize the paused set with the current buffered count.
+    ///
+    /// Called after `decrement` to potentially resume a paused stream. Does not
+    /// enter `Paused` from this path — that only happens on send, in `flow_state`.
     fn update_flow_state(&self, stream_id: Uuid) {
         let count = self.buffered(stream_id);
         let mut paused = self
@@ -234,6 +296,10 @@ impl StreamController {
         }
     }
 
+    /// Remove a stream from the paused set without touching its count.
+    ///
+    /// Used when a terminal frame is received — the stream is done and any
+    /// lingering paused state should not affect future streams.
     fn resume_stream(&self, stream_id: Uuid) {
         let mut paused = self
             .paused
@@ -242,19 +308,29 @@ impl StreamController {
         paused.remove(&stream_id);
     }
 
-    /// Fast path: non-blocking `try_send`.
+    /// Fast path: attempt a non-blocking send.
+    ///
+    /// Falls back to `blocking_deliver` if the channel is momentarily full.
+    /// The stream flow state is not changed here — `Flowing` streams can briefly
+    /// fill the channel without triggering the paused path.
     async fn try_deliver(&self, frame: &Frame) -> SendOutcome {
         match self.tx.try_send(frame.clone()) {
             Ok(()) => SendOutcome::Delivered,
             Err(mpsc::error::TrySendError::Full(_frame)) => {
-                // Channel is full — fall back to blocking with timeout
+                // EDGE: Channel full but stream is still Flowing. Fall back to
+                // blocking rather than dropping so we don't silently lose frames.
                 self.blocking_deliver(frame).await
             }
             Err(mpsc::error::TrySendError::Closed(_)) => SendOutcome::Closed,
         }
     }
 
-    /// Slow path: blocking send with stall timeout.
+    /// Slow path: blocking send with a stall timeout.
+    ///
+    /// Used when the stream is in `Paused` state or when `try_deliver` falls
+    /// back due to a full channel. Returns `Stalled` if the consumer doesn't
+    /// drain within `stall_timeout`, signalling that the caller should cancel
+    /// the stream.
     async fn blocking_deliver(&self, frame: &Frame) -> SendOutcome {
         match tokio::time::timeout(self.config.stall_timeout, self.tx.send(frame.clone())).await {
             Ok(Ok(())) => SendOutcome::Delivered,
@@ -265,19 +341,40 @@ impl StreamController {
 }
 
 /// Subscriber wrapper that acknowledges frames back to the stream controller.
+///
+/// Returned by [`Kernel::subscribe`](crate::kernel::Kernel::subscribe). Wraps
+/// the raw `mpsc::Receiver<Frame>` with automatic backpressure acknowledgment:
+/// each call to `recv` decrements the buffered count for the received frame's
+/// stream, allowing the producer to resume if it was paused at the watermark.
+///
+/// # Why acknowledgment on recv rather than on send
+///
+/// Acknowledging when the consumer calls `recv` rather than when the frame
+/// enters the channel models real consumer progress. If the application is slow
+/// to call `recv`, the buffered count stays high and the producer stays paused,
+/// preventing the channel from silently absorbing an unbounded backlog.
 pub struct Subscriber {
     rx: mpsc::Receiver<Frame>,
+    /// Shared reference to the controller so acks update the same counts the
+    /// router sees when deciding whether to apply backpressure.
     controller: StreamController,
 }
 
 impl Subscriber {
+    /// Wrap a receiver with a controller for backpressure acknowledgment.
     #[must_use]
     pub fn new(rx: mpsc::Receiver<Frame>, controller: StreamController) -> Self {
         Self { rx, controller }
     }
 
+    /// Receive the next frame and acknowledge its consumption to the controller.
+    ///
+    /// Returns `None` when the sender side has been dropped and the channel
+    /// is empty (kernel has shut down or been dropped).
     pub async fn recv(&mut self) -> Option<Frame> {
         let frame = self.rx.recv().await?;
+        // WHY: Ack immediately after recv so the producer can resume as soon
+        // as the consumer processes each frame, rather than waiting for a batch.
         self.controller.ack_frame(&frame);
         Some(frame)
     }

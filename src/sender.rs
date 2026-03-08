@@ -1,4 +1,25 @@
 //! `FrameSender` — helper for sending response frames with common patterns.
+//!
+//! [`FrameSender`] wraps an `mpsc::Sender<Frame>` and provides high-level
+//! methods that encode the most common response protocols:
+//!
+//! | Method | Produces |
+//! |---|---|
+//! | `finish_item` | `Item` + `Done`, or `Error` on failure |
+//! | `finish_items` | `Item`… + `Done`, or `Error` on failure |
+//! | `finish` | `Done` or `Error` on a unit result |
+//! | `send_item` | A single `Item` frame |
+//! | `send_done` | A `Done` frame |
+//! | `send_error` | An `Error` frame with a plain message |
+//! | `send_error_from` | An `Error` frame from an [`ErrorCode`] implementor |
+//!
+//! # Why this exists
+//!
+//! Without `FrameSender`, every `Syscall::dispatch` implementation would need
+//! to manually construct and send correlated frames. The `finish_*` helpers
+//! eliminate the repetitive pattern of matching on `Result` and sending either
+//! items + done or an error, and they ensure the terminal frame is always sent
+//! (callers cannot forget it by accident).
 
 use serde::Serialize;
 use tokio::sync::mpsc;

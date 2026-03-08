@@ -1,4 +1,24 @@
 //! Frame type — the universal in-memory message for all kernel communication.
+//!
+//! All kernel communication uses `Frame` structs moved through `mpsc` channels.
+//! No serialization occurs inside the kernel: frames carry native Rust types and
+//! are only converted to wire formats (protobuf, JSON) at I/O boundaries by gateway
+//! code external to this crate.
+//!
+//! # Correlation
+//!
+//! Response frames are correlated to their request via `parent_id`. The router
+//! uses `parent_id` to look up pending subscribers in its routing tables. Every
+//! response builder method (`item`, `done`, `error`, etc.) sets `parent_id =
+//! self.id`, so callers cannot accidentally break correlation.
+//!
+//! # Data vs Trace
+//!
+//! `data` carries the business payload. `trace` carries observability metadata
+//! (room, span, timing). Keeping them separate prevents observability metadata
+//! from polluting the application payload that subsystems deserialize into typed
+//! structs. The router propagates `trace` through response frames automatically
+//! (via the `response()` helper) so handlers never need to copy it manually.
 
 use std::collections::HashMap;
 
@@ -221,6 +241,19 @@ impl Frame {
 
     // ── Internal ──
 
+    /// Shared construction logic for all response frame variants.
+    ///
+    /// Sets `parent_id = self.id` to establish the correlation that the router
+    /// uses to route responses back to the correct subscribers.
+    ///
+    /// WHY `trace` is cloned: Observability metadata (span context, room, timing)
+    /// must flow from request to response so that the gateway layer can associate
+    /// all frames in a conversation. Cloning here means handlers never need to
+    /// thread `trace` through manually.
+    ///
+    /// WHY `from` is `None`: Response frames represent the subsystem's reply,
+    /// not the original caller's identity. Subsystems that want to identify
+    /// themselves in responses can call `.with_from()` after construction.
     fn response(&self, status: Status, data: Data) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -251,6 +284,10 @@ pub fn to_data<T: Serialize>(value: &T) -> Result<Data, serde_json::Error> {
     })
 }
 
+/// Returns the current time as milliseconds since the Unix epoch.
+///
+/// Returns 0 if the system clock is before the epoch (unreachable in practice)
+/// and `i64::MAX` if the duration overflows `i64` (not until year ~292 million).
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

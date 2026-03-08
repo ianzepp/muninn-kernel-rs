@@ -22,6 +22,11 @@ use crate::frame::Frame;
 
 const DEFAULT_CAPACITY: usize = 256;
 
+/// Maps request ID → the unbounded sender for that request's `CallStream`.
+///
+/// Shared between the `Caller` (which inserts entries before sending requests)
+/// and the dispatcher task (which removes entries on terminal frames). Access
+/// is serialized by a `Mutex` because both sides run concurrently.
 type PendingMap = HashMap<Uuid, mpsc::UnboundedSender<Frame>>;
 
 /// Create a bidirectional pipe with the given channel capacity.
@@ -59,9 +64,26 @@ enum PipeState {
 }
 
 /// One end of a bidirectional pipe.
+///
+/// Subsystems interact with the kernel through a `PipeEnd`: inbound request
+/// frames arrive via `recv()`, and response frames are sent back via `sender()`.
+///
+/// If a subsystem needs to call *other* subsystems through the kernel, it
+/// calls `caller()` to obtain a [`Caller`]. This activates the lazy dispatcher,
+/// which routes incoming responses back to the corresponding [`CallStream`]
+/// rather than surfacing them via `recv()`.
+///
+/// # Invariant
+///
+/// Each `PipeEnd` is owned by exactly one subsystem task. It is not `Clone`
+/// because sharing a single receive end between tasks would create a race for
+/// inbound frames.
 pub struct PipeEnd {
+    /// Sends frames to the *other* end of the pipe (toward the kernel or subsystem).
     tx: mpsc::Sender<Frame>,
     state: PipeState,
+    /// Shared with any `Caller` instances created from this end. The dispatcher
+    /// uses this to route response frames to the correct `CallStream`.
     pending: Arc<Mutex<PendingMap>>,
 }
 
@@ -92,7 +114,21 @@ impl PipeEnd {
         }
     }
 
-    /// Transition from direct to dispatched mode if not already.
+    /// Transition from direct to dispatched mode on the first `caller()` call.
+    ///
+    /// PHASE 1: IDEMPOTENCY CHECK
+    /// Return immediately if already dispatched. `caller()` may be called
+    /// multiple times; the dispatcher should only be spawned once.
+    ///
+    /// PHASE 2: STATE HANDOFF
+    /// Replace the `Direct(rx)` state with `Dispatched(default_rx)`. The raw
+    /// `Receiver` is handed off to the dispatcher task. After this point,
+    /// `recv()` reads from `default_rx` (the unmatched-frames channel) instead
+    /// of the raw channel.
+    ///
+    /// PHASE 3: SPAWN DISPATCHER
+    /// The dispatcher task owns the raw receiver and the pending map. It routes
+    /// matched frames to `CallStream`s and unmatched frames to `default_tx`.
     fn ensure_dispatcher(&mut self) {
         if matches!(self.state, PipeState::Dispatched(_)) {
             return;
@@ -102,6 +138,8 @@ impl PipeEnd {
         let old_state = std::mem::replace(&mut self.state, PipeState::Dispatched(default_rx));
 
         let PipeState::Direct(raw_rx) = old_state else {
+            // NOTE: This branch is unreachable given the check above, but the
+            // compiler can't prove it. Return cleanly rather than panicking.
             return;
         };
 
@@ -111,18 +149,38 @@ impl PipeEnd {
 }
 
 /// Cloneable handle for making outbound requests and receiving correlated responses.
+///
+/// Obtained from [`PipeEnd::caller`]. Multiple `Caller` instances can be created
+/// from the same `PipeEnd` and cloned freely — they all share the same underlying
+/// channel and pending map. Each clone can make independent concurrent calls.
+///
+/// # Protocol
+///
+/// `call()` inserts an entry in the `PendingMap` before sending the request.
+/// The dispatcher task (spawned by `ensure_dispatcher`) routes incoming frames
+/// with matching `parent_id` to the registered `CallStream`. On terminal frames
+/// or `CallStream` drop, the entry is removed.
 #[derive(Clone)]
 pub struct Caller {
     tx: mpsc::Sender<Frame>,
-    pending: Arc<Mutex<PendingMap>>,
+    /// Shared with the dispatcher task. Entries are inserted by `call()` and
+    /// removed by the dispatcher on terminal frames or by `CallStream::drop`.
+    pub(crate) pending: Arc<Mutex<PendingMap>>,
 }
 
 impl Caller {
     /// Send a request and receive a stream of correlated responses.
+    ///
+    /// Inserts a pending entry before sending so the dispatcher can route
+    /// response frames correctly even if they arrive before `call` returns.
+    /// If the send fails, the pending entry is cleaned up to avoid a leak.
     pub async fn call(&self, request: Frame) -> Result<CallStream, PipeError> {
         let id = request.id;
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
 
+        // WHY: Insert before send, not after. If the response arrives before
+        // the send returns, the dispatcher would find no pending entry and send
+        // the frame to the default (unmatched) channel instead.
         {
             let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.insert(id, stream_tx);
@@ -148,8 +206,20 @@ impl Caller {
 }
 
 /// An owned stream of response frames correlated to a single request.
+///
+/// Returned by [`Caller::call`]. Receives only frames whose `parent_id` matches
+/// the originating request's `id`, allowing multiple concurrent calls over the
+/// same pipe without interleaving.
+///
+/// # Cleanup on Drop
+///
+/// Dropping a `CallStream` before it reaches a terminal frame removes its entry
+/// from the pending map. This prevents the dispatcher from accumulating entries
+/// for abandoned calls. The channel receiver is dropped first, so the dispatcher
+/// will see a send error and also clean up its reference.
 pub struct CallStream {
     rx: mpsc::UnboundedReceiver<Frame>,
+    /// The request ID this stream is correlated to, used for pending map cleanup.
     id: Uuid,
     pending: Arc<Mutex<PendingMap>>,
 }
@@ -175,14 +245,41 @@ impl CallStream {
 }
 
 impl Drop for CallStream {
+    /// Remove the pending map entry when the stream is dropped.
+    ///
+    /// WHY: Without this, dropping a `CallStream` mid-stream would leave a
+    /// dead `UnboundedSender` in the pending map. The dispatcher would keep
+    /// sending to it (succeeding, since unbounded channels don't fail on send
+    /// to a dead receiver) until a terminal frame or until the pending map is
+    /// leaked forever if the subsystem never sends a terminal frame.
     fn drop(&mut self) {
         let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&self.id);
     }
 }
 
-/// Background dispatcher task: routes incoming frames by `parent_id` to pending
-/// `CallStream` receivers. Unmatched frames go to the default channel.
+/// Background dispatcher task: routes incoming frames to `CallStream`s by `parent_id`.
+///
+/// This task embodies the "lazy dispatcher" pattern: it is only spawned when a
+/// subsystem first calls `PipeEnd::caller()`, so subsystems that never make
+/// outbound calls pay zero overhead.
+///
+/// # Routing Logic
+///
+/// For each incoming frame:
+/// - If `parent_id` matches a pending `CallStream`, forward to that stream.
+/// - Otherwise, forward to `default_tx` so `PipeEnd::recv()` can surface it
+///   (e.g., inbound requests arriving at the subsystem's pipe end).
+///
+/// # Cleanup
+///
+/// Pending entries are removed when a terminal frame is delivered, or when the
+/// `CallStream` receiver has been dropped (send failure). This prevents the
+/// pending map from growing unboundedly.
+///
+/// The task exits when `raw_rx` is closed (the kernel or PipeEnd was dropped).
+/// At that point, `default_tx` is dropped, causing `PipeEnd::recv()` to return
+/// `None` and the subsystem's receive loop to terminate naturally.
 async fn run_dispatcher(
     mut raw_rx: mpsc::Receiver<Frame>,
     default_tx: mpsc::UnboundedSender<Frame>,
@@ -192,20 +289,27 @@ async fn run_dispatcher(
         let parent_id = frame.parent_id;
         let is_terminal = frame.status.is_terminal();
 
+        // Look up the CallStream for this frame's parent without holding the
+        // lock during the send — lock durations should be as short as possible.
         let target = parent_id.and_then(|pid| {
             let guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.get(&pid).cloned()
         });
 
         let Some(stream_tx) = target else {
+            // EDGE: No matching CallStream — route to default channel so the
+            // PipeEnd's recv() sees it. Inbound requests arrive this way.
             if default_tx.send(frame).is_err() {
-                break;
+                break; // Default receiver dropped — pipe end is gone, exit task
             }
             continue;
         };
 
         let send_failed = stream_tx.send(frame).is_err();
 
+        // Clean up the pending entry on terminal frames or send failures.
+        // Terminal: no more frames will arrive for this stream.
+        // Send failure: CallStream was dropped, so its receiver is gone.
         if is_terminal || send_failed {
             if let Some(pid) = parent_id {
                 let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
