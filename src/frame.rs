@@ -1,0 +1,213 @@
+//! Frame type — the universal in-memory message for all kernel communication.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+/// Flat key-value payload carried by a frame.
+pub type Data = HashMap<String, Value>;
+
+/// Trait for subsystem errors that can be converted to structured error frames.
+pub trait ErrorCode: std::fmt::Display {
+    /// Machine-readable error code (e.g., `"E_NOT_FOUND"`).
+    fn error_code(&self) -> &'static str;
+
+    /// Whether the caller should retry this operation.
+    fn retryable(&self) -> bool {
+        false
+    }
+}
+
+/// Lifecycle status of a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    /// Initiates a syscall.
+    Request,
+    /// Single streaming result (non-terminal).
+    Item,
+    /// Batch streaming result (non-terminal).
+    Bulk,
+    /// Successful terminal response.
+    Done,
+    /// Failed terminal response.
+    Error,
+    /// Abort an in-flight request.
+    Cancel,
+}
+
+impl Status {
+    /// Returns `true` if this status ends a response stream.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Error | Self::Cancel)
+    }
+}
+
+/// A single message in the kernel's in-memory protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Frame {
+    /// Unique identifier for this frame.
+    pub id: Uuid,
+    /// Correlates response frames to the originating request.
+    pub parent_id: Option<Uuid>,
+    /// Milliseconds since Unix epoch.
+    pub ts: i64,
+    /// Sender identity (user ID, subsystem label, actor name).
+    pub from: Option<String>,
+    /// Namespaced operation: `"prefix:verb"`.
+    pub syscall: String,
+    /// Lifecycle position.
+    pub status: Status,
+    /// Observability metadata (room, span, timing), separate from payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<Value>,
+    /// Business payload.
+    #[serde(default)]
+    pub data: Data,
+}
+
+impl Frame {
+    // ── Constructors ──
+
+    /// Create a new request frame.
+    #[must_use]
+    pub fn request(syscall: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            parent_id: None,
+            ts: now_millis(),
+            from: None,
+            syscall: syscall.into(),
+            status: Status::Request,
+            trace: None,
+            data: HashMap::new(),
+        }
+    }
+
+    /// Create a new request frame with data.
+    #[must_use]
+    pub fn request_with(syscall: impl Into<String>, data: Data) -> Self {
+        let mut frame = Self::request(syscall);
+        frame.data = data;
+        frame
+    }
+
+    // ── Response builders (set parent_id = self.id) ──
+
+    /// Build an item response correlated to this request.
+    #[must_use]
+    pub fn item(&self, data: Data) -> Self {
+        self.response(Status::Item, data)
+    }
+
+    /// Build a bulk response correlated to this request.
+    #[must_use]
+    pub fn bulk(&self, data: Data) -> Self {
+        self.response(Status::Bulk, data)
+    }
+
+    /// Build a done response correlated to this request.
+    #[must_use]
+    pub fn done(&self) -> Self {
+        self.response(Status::Done, HashMap::new())
+    }
+
+    /// Build a done response with data correlated to this request.
+    #[must_use]
+    pub fn done_with(&self, data: Data) -> Self {
+        self.response(Status::Done, data)
+    }
+
+    /// Build an error response correlated to this request.
+    #[must_use]
+    pub fn error(&self, message: impl Into<String>) -> Self {
+        let mut data = HashMap::new();
+        data.insert("code".into(), Value::String("E_INTERNAL".into()));
+        data.insert("message".into(), Value::String(message.into()));
+        data.insert("retryable".into(), Value::Bool(false));
+        self.response(Status::Error, data)
+    }
+
+    /// Build an error response from an [`ErrorCode`] implementor.
+    #[must_use]
+    pub fn error_from(&self, err: &impl ErrorCode) -> Self {
+        let mut data = HashMap::new();
+        data.insert("code".into(), Value::String(err.error_code().into()));
+        data.insert("message".into(), Value::String(err.to_string()));
+        data.insert("retryable".into(), Value::Bool(err.retryable()));
+        self.response(Status::Error, data)
+    }
+
+    /// Build a cancel frame targeting this request.
+    #[must_use]
+    pub fn cancel(&self) -> Self {
+        self.response(Status::Cancel, HashMap::new())
+    }
+
+    // ── Builders ──
+
+    /// Set the `from` field.
+    #[must_use]
+    pub fn with_from(mut self, from: impl Into<String>) -> Self {
+        self.from = Some(from.into());
+        self
+    }
+
+    /// Set the `trace` field.
+    #[must_use]
+    pub fn with_trace(mut self, trace: Value) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
+    /// Set a single key-value pair in `data`.
+    #[must_use]
+    pub fn with_data(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.data.insert(key.into(), value);
+        self
+    }
+
+    // ── Queries ──
+
+    /// Extract the syscall prefix (e.g., `"vfs:read"` → `"vfs"`).
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        self.syscall
+            .split_once(':')
+            .map_or(&self.syscall, |(prefix, _)| prefix)
+    }
+
+    /// Extract the syscall verb (e.g., `"vfs:read"` → `"read"`).
+    #[must_use]
+    pub fn verb(&self) -> &str {
+        self.syscall.split_once(':').map_or("", |(_, verb)| verb)
+    }
+
+    // ── Internal ──
+
+    fn response(&self, status: Status, data: Data) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            parent_id: Some(self.id),
+            ts: now_millis(),
+            from: None,
+            syscall: self.syscall.clone(),
+            status,
+            trace: self.trace.clone(),
+            data,
+        }
+    }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+#[path = "frame_test.rs"]
+mod tests;
