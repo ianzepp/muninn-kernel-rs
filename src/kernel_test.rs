@@ -407,3 +407,66 @@ async fn kernel_cancel_triggers_token_for_syscall_handler() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(was_cancelled.load(Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn kernel_stays_responsive_when_a_subsystem_queue_is_full() {
+    let mut kernel = Kernel::new();
+    let _stuck_end = kernel.register("stuck");
+    let mut ok_end = kernel.register("ok");
+    let mut rx = kernel.subscribe();
+    let sender = kernel.sender();
+
+    let _handle = kernel.start();
+
+    for _ in 0..256 {
+        sender.send(Frame::request("stuck:work")).await.unwrap();
+    }
+
+    let overflow = Frame::request("stuck:work");
+    let overflow_id = overflow.id;
+    sender.send(overflow).await.unwrap();
+
+    let ok_req = Frame::request("ok:ping");
+    let ok_id = ok_req.id;
+    sender.send(ok_req).await.unwrap();
+
+    let received_ok = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        ok_end.recv(),
+    )
+    .await
+    .expect("router should keep draining unrelated routes")
+    .expect("ok route should receive the request");
+    assert_eq!(received_ok.id, ok_id);
+
+    ok_end.sender().send(received_ok.done()).await.unwrap();
+
+    let mut saw_overflow = false;
+    let mut saw_ok_done = false;
+
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("subscriber should receive terminal responses")
+            .expect("subscriber channel should stay open");
+
+        match frame.parent_id {
+            Some(parent_id) if parent_id == overflow_id => {
+                saw_overflow = true;
+                assert_eq!(frame.status, Status::Error);
+                assert_eq!(
+                    frame.data.get("code").and_then(|value| value.as_str()),
+                    Some("E_TIMEOUT")
+                );
+            }
+            Some(parent_id) if parent_id == ok_id => {
+                saw_ok_done = true;
+                assert_eq!(frame.status, Status::Done);
+            }
+            other => panic!("unexpected response parent_id: {other:?}"),
+        }
+    }
+
+    assert!(saw_overflow);
+    assert!(saw_ok_done);
+}

@@ -82,9 +82,7 @@ impl Router {
             let err =
                 KernelError::no_route(format!("no handler for syscall: {}", frame.syscall));
             let error_frame = frame.error_from(&err);
-            for sub in &self.subscribers {
-                sub.send(&error_frame).await;
-            }
+            self.deliver_to_subscribers(&error_frame).await;
             return;
         };
 
@@ -104,8 +102,29 @@ impl Router {
             },
         );
 
-        // Forward to subsystem
-        let _ = subsystem_tx.send(frame.clone()).await;
+        match subsystem_tx.try_send(frame.clone()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.pending.remove(&frame.id);
+                self.active.remove(&frame.id);
+
+                let err = KernelError::timeout(format!(
+                    "subsystem queue full for syscall: {}",
+                    frame.syscall
+                ));
+                self.deliver_to_subscribers(&frame.error_from(&err)).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.pending.remove(&frame.id);
+                self.active.remove(&frame.id);
+
+                let err = KernelError::no_route(format!(
+                    "handler unavailable for syscall: {}",
+                    frame.syscall
+                ));
+                self.deliver_to_subscribers(&frame.error_from(&err)).await;
+            }
+        }
     }
 
     // ── Response routing ──
@@ -126,6 +145,12 @@ impl Router {
         if frame.status.is_terminal() {
             self.pending.remove(&parent_id);
             self.active.remove(&parent_id);
+        }
+    }
+
+    async fn deliver_to_subscribers(&self, frame: &Frame) {
+        for sub in &self.subscribers {
+            sub.send(frame).await;
         }
     }
 
@@ -156,9 +181,7 @@ impl Router {
                     data.insert("name".into(), serde_json::Value::String(name.clone()));
                     data.insert("owner".into(), serde_json::Value::String(owner.clone()));
                     let item = frame.item(data);
-                    for sub in &self.subscribers {
-                        sub.send(&item).await;
-                    }
+                    self.deliver_to_subscribers(&item).await;
                 }
                 frame.done()
             }
@@ -174,9 +197,7 @@ impl Router {
             self.subscribers.iter().map(StreamController::clone).collect(),
         );
 
-        for sub in &self.subscribers {
-            sub.send(&response).await;
-        }
+        self.deliver_to_subscribers(&response).await;
 
         if response.status.is_terminal() {
             self.pending.remove(&frame.id);
