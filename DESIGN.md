@@ -1,4 +1,4 @@
-# rust-kernel — Design Document
+# muninn-kernel — Design Document
 
 ## Overview
 
@@ -11,7 +11,7 @@ This crate distills patterns from four prior projects into a single reusable lib
 | **monk-os-kernel** | TypeScript | Message-pure kernel, sigcall registry, backpressure (StreamController) |
 | **prior** | Rust | Pipe/Caller/CallStream, lazy dispatcher, PipeEnd abstraction, FrameSender helpers |
 | **abbot** | Rust | Syscall trait, KernelDispatcher with lanes, SigcallHub (outbound delivery), backpressure watermarks |
-| **gauntlet-week-1** | Rust | Outcome enum, protobuf Frame codec (extracted to `rust-frames`), prefix-based dispatch |
+| **gauntlet-week-1** | Rust | Outcome enum, protobuf Frame codec (extracted to `muninn-frames`), prefix-based dispatch |
 
 ---
 
@@ -69,12 +69,12 @@ impl Frame {
 
     // Response constructors (set parent_id = self.id)
     pub fn item(&self, data: Data) -> Self;
-    pub fn item_from<T: Serialize>(&self, value: &T) -> Self;
+    pub fn item_from<T: Serialize>(&self, value: &T) -> Result<Self, serde_json::Error>;
     pub fn bulk(&self, data: Data) -> Self;
-    pub fn bulk_from<T: Serialize>(&self, value: &T) -> Self;
+    pub fn bulk_from<T: Serialize>(&self, value: &T) -> Result<Self, serde_json::Error>;
     pub fn done(&self) -> Self;
     pub fn done_with(&self, data: Data) -> Self;
-    pub fn done_from<T: Serialize>(&self, value: &T) -> Self;
+    pub fn done_from<T: Serialize>(&self, value: &T) -> Result<Self, serde_json::Error>;
     pub fn error(&self, message: impl Into<String>) -> Self;
     pub fn error_from(&self, err: &(impl ErrorCode + ?Sized)) -> Self;
     pub fn cancel(&self) -> Self;
@@ -83,13 +83,13 @@ impl Frame {
     pub fn with_from(self, from: impl Into<String>) -> Self;
     pub fn with_trace(self, trace: Value) -> Self;
     pub fn with_data(self, key: impl Into<String>, value: Value) -> Self;
-    pub fn with_field(self, key: impl Into<String>, value: impl Serialize) -> Self;
+    pub fn with_field(self, key: impl Into<String>, value: impl Serialize) -> Result<Self, serde_json::Error>;
 }
 ```
 
-The `_from` variants (`item_from`, `done_from`, `bulk_from`) serialize a struct directly into the frame's data map via `to_data()`. If the value serializes to a JSON object, its fields become data keys; otherwise the value is stored under a `"value"` key.
+The `_from` variants (`item_from`, `done_from`, `bulk_from`) serialize a struct directly into the frame's data map via `to_data()`. If the value serializes to a JSON object, its fields become data keys; otherwise the value is stored under a `"value"` key. These helpers are fallible and return `serde_json::Error` rather than silently substituting invalid payloads.
 
-`with_field` accepts `impl Serialize` instead of `Value`, so handlers don't need to import `serde_json::Value` or manually construct `Value` variants.
+`with_field` accepts `impl Serialize` instead of `Value`, so handlers don't need to import `serde_json::Value` or manually construct `Value` variants. It is also fallible for the same reason.
 
 ### ErrorCode Trait
 
@@ -142,7 +142,7 @@ The crate separates the **builder** (Kernel) from the **runtime** (Router), foll
 
 1. **Request frames**: Extract prefix from `syscall` (e.g., `"vfs:read"` → `"vfs"`). Look up the subsystem channel in `routes`. If not found, check the sigcall registry. If still not found, send an error response back to all subscribers.
 
-2. **Cancel frames**: Look up `parent_id` in `active` (which subsystem is handling the target request). Forward the cancel frame to that subsystem. Trigger the `CancellationToken`. Clean up `pending` and `active` entries.
+2. **Cancel frames**: Look up `parent_id` in `active` (which subsystem is handling the target request). Trigger the handler's cancellation hook, best-effort forward the cancel frame to the subsystem, and emit an immediate terminal `Cancel` response to subscribers.
 
 3. **Response frames** (Item, Bulk, Done, Error): Look up `parent_id` in `pending` to find which `StreamController`-wrapped subscribers are waiting. Fan out the response with backpressure. On terminal status, remove entries from `pending` and `active`.
 
@@ -157,8 +157,8 @@ impl Kernel {
     /// Register a Syscall trait implementor (auto-creates pipe and receive loop).
     pub fn register_syscall(&mut self, handler: Arc<dyn Syscall>);
 
-    /// Subscribe to receive response frames (returns raw mpsc::Receiver).
-    pub fn subscribe(&mut self) -> mpsc::Receiver<Frame>;
+    /// Subscribe to receive response frames.
+    pub fn subscribe(&mut self) -> Subscriber;
 
     /// Start the kernel event loop. Creates a Router and consumes self.
     pub fn start(self) -> JoinHandle<()>;
@@ -425,9 +425,9 @@ Cancellation is cooperative and propagated via `tokio_util::sync::CancellationTo
 
 1. Caller sends a `Cancel` frame with `parent_id` set to the target request's `id`.
 2. Router looks up the target in `active` to find which subsystem is handling it.
-3. Router triggers the `CancellationToken` associated with the request.
-4. Router forwards the Cancel frame to the subsystem.
-5. Router cleans up `pending` and `active` entries.
+3. Router triggers the cancellation hook associated with the request. For `register_syscall()` handlers this directly cancels the token the handler is waiting on.
+4. Router best-effort forwards the Cancel frame to the subsystem pipe.
+5. Router emits a terminal `Cancel` frame to subscribers and cleans up routing state.
 
 For `register_syscall` handlers, the subsystem receive loop maintains its own token map. When a Cancel frame arrives, it removes the token and calls `cancel()`. The handler observes cancellation via `cancel.is_cancelled()` or `cancel.cancelled().await`.
 
@@ -456,11 +456,11 @@ async fn dispatch(
 
 ## Subscriber
 
-External code (gateways, test harnesses) receives response frames via `kernel.subscribe()`, which returns a raw `mpsc::Receiver<Frame>`. Internally, each subscriber is wrapped in a `StreamController` for backpressure.
+External code (gateways, test harnesses) receives response frames via `kernel.subscribe()`, which returns a lightweight `Subscriber`. Internally, the subscriber wraps an `mpsc::Receiver<Frame>` together with its `StreamController` so each `recv()` call acknowledges consumption back to the backpressure tracker.
 
 ```rust
-let mut rx = kernel.subscribe();
-while let Some(frame) = rx.recv().await {
+let mut subscriber = kernel.subscribe();
+while let Some(frame) = subscriber.recv().await {
     // handle frame
 }
 ```
@@ -469,12 +469,11 @@ Subscribers see **all** response frames that flow through the kernel (fan-out fr
 
 For room-scoped or connection-scoped delivery, the gateway layer filters frames by `parent_id` correlation or `trace` metadata — the kernel itself does not filter.
 
-### Future: Subscriber Type
+### Future: Richer Subscriber
 
-A dedicated `Subscriber` wrapper may be added to provide:
+The current `Subscriber` only acknowledges consumed frames. A richer version may add:
 - Filtering by `parent_id` or syscall prefix (connection-scoped delivery)
 - Typed deserialization helpers (`recv_as::<T>()`)
-- Backpressure acknowledgment signals back to the `StreamController`
 - Automatic reconnect/resubscribe on channel close
 
 ---
@@ -482,7 +481,7 @@ A dedicated `Subscriber` wrapper may be added to provide:
 ## Module Layout
 
 ```
-rust-kernel/
+muninn-kernel-rs/
 ├── Cargo.toml
 ├── DESIGN.md
 ├── src/
@@ -513,7 +512,7 @@ rust-kernel/
 | `async-trait` | Syscall trait (until async fn in traits stabilizes fully) |
 
 **Notably absent:**
-- No `prost` / protobuf — serialization is the boundary's problem (see `rust-frames`).
+- No `prost` / protobuf — serialization is the boundary's problem (see `muninn-frames`).
 - No `axum` / `hyper` / `tungstenite` — transport is the gateway's problem.
 - No `sqlx` / `sqlite` — persistence is a subsystem's problem.
 
@@ -539,15 +538,15 @@ rust-kernel/
 
 ---
 
-## Relationship to rust-frames
+## Relationship to muninn-frames
 
-The `rust-frames` crate handles **wire encoding** (protobuf ↔ Frame). This crate handles **in-memory routing**. They share the same conceptual Frame shape but are independent:
+The `muninn-frames` crate handles **wire encoding** (protobuf ↔ Frame). This crate handles **in-memory routing**. They share the same conceptual Frame shape but are independent:
 
-- `rust-frames::Frame` uses `String` for IDs and `serde_json::Value` for data (wire-friendly).
-- `rust-kernel::Frame` uses `Uuid` for IDs and `HashMap<String, Value>` for data (routing-friendly).
+- `muninn-frames::Frame` uses `String` for IDs and `serde_json::Value` for data (wire-friendly).
+- `muninn-kernel::Frame` uses `Uuid` for IDs and `HashMap<String, Value>` for data (routing-friendly).
 - Gateway code converts between the two at the WebSocket/HTTP boundary.
 
-They can optionally share a dependency, or consumers can write their own conversion. The kernel crate does not depend on the frames crate.
+They should stay decoupled. Shared conversion logic belongs in a separate bridge crate or boundary module; `muninn-kernel` itself should not depend on `muninn-frames`.
 
 ---
 
@@ -605,4 +604,4 @@ They can optionally share a dependency, or consumers can write their own convers
 
 **Broadcast mechanics**: Reply to sender includes `parent_id` for correlation. Peer broadcast strips `parent_id` (they didn't request it).
 
-**protobuf wire format**: Binary encoding via Prost 0.13. Recursive `serde_json::Value ↔ prost_types::Value` conversion. Extracted to `rust-frames` crate.
+**protobuf wire format**: Binary encoding via Prost 0.13. Recursive `serde_json::Value ↔ prost_types::Value` conversion. Extracted to `muninn-frames`.
