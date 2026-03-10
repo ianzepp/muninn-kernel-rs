@@ -32,7 +32,7 @@ type PendingMap = HashMap<Uuid, mpsc::UnboundedSender<Frame>>;
 /// Create a bidirectional pipe with the given channel capacity.
 ///
 /// Returns two ends: each can send to and receive from the other.
-#[must_use] 
+#[must_use]
 pub fn pipe(capacity: usize) -> (PipeEnd, PipeEnd) {
     let (a_tx, a_rx) = mpsc::channel(capacity);
     let (b_tx, b_rx) = mpsc::channel(capacity);
@@ -51,7 +51,7 @@ pub fn pipe(capacity: usize) -> (PipeEnd, PipeEnd) {
 }
 
 /// Create a bidirectional pipe with the default capacity.
-#[must_use] 
+#[must_use]
 pub fn pipe_default() -> (PipeEnd, PipeEnd) {
     pipe(DEFAULT_CAPACITY)
 }
@@ -97,7 +97,7 @@ impl PipeEnd {
     }
 
     /// Get a cloneable sender for sending frames back through the pipe.
-    #[must_use] 
+    #[must_use]
     pub fn sender(&self) -> mpsc::Sender<Frame> {
         self.tx.clone()
     }
@@ -182,12 +182,18 @@ impl Caller {
         // the send returns, the dispatcher would find no pending entry and send
         // the frame to the default (unmatched) channel instead.
         {
-            let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.insert(id, stream_tx);
         }
 
         if self.tx.send(request).await.is_err() {
-            let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.remove(&id);
             return Err(PipeError::SendFailed);
         }
@@ -253,7 +259,10 @@ impl Drop for CallStream {
     /// to a dead receiver) until a terminal frame or until the pending map is
     /// leaked forever if the subsystem never sends a terminal frame.
     fn drop(&mut self) {
-        let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&self.id);
     }
 }
@@ -277,7 +286,7 @@ impl Drop for CallStream {
 /// `CallStream` receiver has been dropped (send failure). This prevents the
 /// pending map from growing unboundedly.
 ///
-/// The task exits when `raw_rx` is closed (the kernel or PipeEnd was dropped).
+/// The task exits when `raw_rx` is closed (the kernel or `PipeEnd` was dropped).
 /// At that point, `default_tx` is dropped, causing `PipeEnd::recv()` to return
 /// `None` and the subsystem's receive loop to terminate naturally.
 async fn run_dispatcher(
@@ -292,7 +301,9 @@ async fn run_dispatcher(
         // Look up the CallStream for this frame's parent without holding the
         // lock during the send — lock durations should be as short as possible.
         let target = parent_id.and_then(|pid| {
-            let guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.get(&pid).cloned()
         });
 
@@ -312,11 +323,20 @@ async fn run_dispatcher(
         // Send failure: CallStream was dropped, so its receiver is gone.
         if is_terminal || send_failed {
             if let Some(pid) = parent_id {
-                let mut guard = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.remove(&pid);
             }
         }
     }
+
+    // If the raw pipe closes abruptly, drop all pending stream senders so
+    // in-flight CallStreams wake up with `None` instead of hanging forever.
+    let mut guard = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.clear();
 }
 
 #[cfg(test)]

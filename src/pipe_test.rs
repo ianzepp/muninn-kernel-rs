@@ -1,9 +1,13 @@
+use std::time::Duration;
+
+use tokio::time::timeout;
+
 use crate::frame::{Frame, Status};
 use crate::pipe::{pipe, pipe_default};
 
 #[tokio::test]
 async fn pipe_send_and_recv() {
-    let (mut end_a, mut end_b) = pipe(16);
+    let (end_a, mut end_b) = pipe(16);
 
     let frame = Frame::request("test:ping");
     let id = frame.id;
@@ -132,7 +136,7 @@ async fn caller_send_fire_and_forget() {
 
 #[tokio::test]
 async fn unmatched_frames_go_to_recv() {
-    let (mut end_a, mut end_b) = pipe(16);
+    let (mut end_a, end_b) = pipe(16);
     let _caller = end_a.caller(); // Activate dispatcher
 
     // Send a request (no parent_id, so it won't match any pending call)
@@ -170,8 +174,28 @@ async fn call_stream_drop_cleans_up_pending() {
 }
 
 #[tokio::test]
+async fn pending_call_streams_close_when_remote_end_drops() {
+    let (mut end_a, mut end_b) = pipe(16);
+    let caller = end_a.caller();
+
+    let req = Frame::request("test:op");
+    let id = req.id;
+    let mut stream = caller.call(req).await.unwrap();
+
+    let received = end_b.recv().await.unwrap();
+    assert_eq!(received.id, id);
+
+    drop(end_b);
+
+    let next = timeout(Duration::from_secs(1), stream.recv())
+        .await
+        .expect("call stream should wake when remote end drops");
+    assert!(next.is_none());
+}
+
+#[tokio::test]
 async fn pipe_default_works() {
-    let (mut end_a, mut end_b) = pipe_default();
+    let (end_a, mut end_b) = pipe_default();
 
     let frame = Frame::request("test:default");
     end_a.sender().send(frame).await.unwrap();
