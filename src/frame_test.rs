@@ -212,10 +212,7 @@ fn with_field_serializes_primitives() {
         .unwrap();
     assert_eq!(f.data.get("name").and_then(Value::as_str), Some("alice"));
     assert_eq!(f.data.get("count").and_then(Value::as_i64), Some(42));
-    assert_eq!(
-        f.data.get("active").and_then(Value::as_bool),
-        Some(true)
-    );
+    assert_eq!(f.data.get("active").and_then(Value::as_bool), Some(true));
 }
 
 #[test]

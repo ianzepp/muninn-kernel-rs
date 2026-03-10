@@ -185,7 +185,10 @@ impl StreamController {
     /// Get the current buffered count for a stream.
     #[must_use]
     pub fn buffered(&self, stream_id: Uuid) -> usize {
-        let guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.get(&stream_id).copied().unwrap_or(0)
     }
 
@@ -252,14 +255,20 @@ impl StreamController {
     }
 
     fn increment(&self, stream_id: Uuid) {
-        let mut guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard.entry(stream_id).or_insert(0) += 1;
     }
 
     /// Decrement the buffered count for a stream. Removes the entry when it
     /// reaches zero to avoid keeping empty entries across long-lived sessions.
     fn decrement(&self, stream_id: Uuid) {
-        let mut guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(count) = guard.get_mut(&stream_id) else {
             return;
         };
@@ -272,7 +281,10 @@ impl StreamController {
     }
 
     fn remove_stream(&self, stream_id: Uuid) {
-        let mut guard = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&stream_id);
     }
 

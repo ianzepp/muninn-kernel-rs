@@ -38,7 +38,7 @@ pub struct FrameSender {
 
 impl FrameSender {
     /// Create a new sender wrapping an mpsc channel.
-    #[must_use] 
+    #[must_use]
     pub fn new(tx: mpsc::Sender<Frame>) -> Self {
         Self { tx }
     }

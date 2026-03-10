@@ -87,7 +87,10 @@ impl SigcallRegistry {
             return Err(SigcallError::Reserved { name: name.into() });
         }
 
-        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = guard.get(name) {
             if existing.owner != owner {
@@ -110,7 +113,10 @@ impl SigcallRegistry {
 
     /// Unregister a handler. Only the registering owner can unregister.
     pub fn unregister(&self, name: &str, owner: &str) -> Result<(), SigcallError> {
-        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let Some(existing) = guard.get(name) else {
             return Err(SigcallError::NotRegistered { name: name.into() });
@@ -132,21 +138,30 @@ impl SigcallRegistry {
     ///
     /// Called on process exit or connection close to prevent orphaned handlers.
     pub fn unregister_all(&self, owner: &str) {
-        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.retain(|_, reg| reg.owner != owner);
     }
 
     /// Look up a handler for a syscall name.
     #[must_use]
     pub fn lookup(&self, name: &str) -> Option<mpsc::Sender<Frame>> {
-        let guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.get(name).map(|reg| reg.tx.clone())
     }
 
     /// List all registered handler names and their owners.
     #[must_use]
     pub fn list(&self) -> Vec<(String, String)> {
-        let guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .iter()
             .map(|(name, reg)| (name.clone(), reg.owner.clone()))
@@ -156,7 +171,10 @@ impl SigcallRegistry {
     /// Number of registered handlers.
     #[must_use]
     pub fn len(&self) -> usize {
-        let guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.len()
     }
 

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use crate::backpressure::{BackpressureConfig, SendOutcome, StreamController, Subscriber};
 use crate::frame::{Frame, Status};
+use tokio::sync::mpsc;
 
 fn small_config() -> BackpressureConfig {
     BackpressureConfig {

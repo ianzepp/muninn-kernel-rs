@@ -187,8 +187,7 @@ impl Kernel {
 
                         let request_id = frame.id;
                         tokio::spawn(async move {
-                            let result =
-                                handler.dispatch(&frame, &sender, &caller, cancel).await;
+                            let result = handler.dispatch(&frame, &sender, &caller, cancel).await;
                             // Auto-send error frame if handler returned Err,
                             // removing boilerplate from the common single-error case.
                             if let Err(err) = result {

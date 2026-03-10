@@ -137,8 +137,7 @@ impl Router {
             .or_else(|| self.sigcalls.lookup(&frame.call));
 
         let Some(subsystem_tx) = subsystem_tx else {
-            let err =
-                KernelError::no_route(format!("no handler for call: {}", frame.call));
+            let err = KernelError::no_route(format!("no handler for call: {}", frame.call));
             let error_frame = frame.error_from(&err);
             self.deliver_to_subscribers(&error_frame).await;
             return;
@@ -149,7 +148,10 @@ impl Router {
         // this point won't see responses for already-dispatched requests.
         self.pending.insert(
             frame.id,
-            self.subscribers.iter().map(StreamController::clone).collect(),
+            self.subscribers
+                .iter()
+                .map(StreamController::clone)
+                .collect(),
         );
 
         // Record the subsystem channel so Cancel frames can be forwarded.
@@ -171,20 +173,16 @@ impl Router {
                 self.pending.remove(&frame.id);
                 self.active.remove(&frame.id);
 
-                let err = KernelError::timeout(format!(
-                    "subsystem queue full for call: {}",
-                    frame.call
-                ));
+                let err =
+                    KernelError::timeout(format!("subsystem queue full for call: {}", frame.call));
                 self.deliver_to_subscribers(&frame.error_from(&err)).await;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.pending.remove(&frame.id);
                 self.active.remove(&frame.id);
 
-                let err = KernelError::no_route(format!(
-                    "handler unavailable for call: {}",
-                    frame.call
-                ));
+                let err =
+                    KernelError::no_route(format!("handler unavailable for call: {}", frame.call));
                 self.deliver_to_subscribers(&frame.error_from(&err)).await;
             }
         }
@@ -328,7 +326,10 @@ impl Router {
         // route_response would find nothing and drop the frame.
         self.pending.insert(
             frame.id,
-            self.subscribers.iter().map(StreamController::clone).collect(),
+            self.subscribers
+                .iter()
+                .map(StreamController::clone)
+                .collect(),
         );
 
         self.deliver_to_subscribers(&response).await;

@@ -50,10 +50,13 @@ impl Syscall for StreamSyscall {
         _cancel: CancellationToken,
     ) -> Result<(), Box<dyn ErrorCode + Send>> {
         for i in 0..3 {
-            let item = frame.item_from(&serde_json::json!({"index": i})).map_err(|err| {
-                Box::new(KernelError::internal(format!("failed to serialize item: {err}")))
-                    as Box<dyn ErrorCode + Send>
-            })?;
+            let item = frame
+                .item_from(&serde_json::json!({"index": i}))
+                .map_err(|err| {
+                    Box::new(KernelError::internal(format!(
+                        "failed to serialize item: {err}"
+                    ))) as Box<dyn ErrorCode + Send>
+                })?;
             let _ = tx.send(item).await;
         }
         let _ = tx.send_done(frame).await;
@@ -474,13 +477,10 @@ async fn kernel_stays_responsive_when_a_subsystem_queue_is_full() {
     let ok_id = ok_req.id;
     sender.send(ok_req).await.unwrap();
 
-    let received_ok = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        ok_end.recv(),
-    )
-    .await
-    .expect("router should keep draining unrelated routes")
-    .expect("ok route should receive the request");
+    let received_ok = tokio::time::timeout(std::time::Duration::from_millis(200), ok_end.recv())
+        .await
+        .expect("router should keep draining unrelated routes")
+        .expect("ok route should receive the request");
     assert_eq!(received_ok.id, ok_id);
 
     ok_end.sender().send(received_ok.done()).await.unwrap();
